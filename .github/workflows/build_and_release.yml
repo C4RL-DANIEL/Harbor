@@ -1,0 +1,554 @@
+name: Build and Release
+
+# Triggered by semantic-version tags (v1.2.3 and pre-release tags such as
+# v1.2.3-rc.1) and by a manual dispatch that supplies a version string.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, with or without a leading v (e.g. 1.2.3 or v1.2.3-rc.1)'
+        required: true
+        type: string
+
+# GitHub Pages deployment needs id-token + pages, and releasing needs contents.
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# Every run of this workflow publishes to the same GitHub Pages site, so all
+# releases must serialize rather than cancel one another mid-deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.24.5'
+  JAVA_VERSION: '17'
+  # Documented fallback used when the HARBOR_API_BASE_URL repository variable
+  # is unset, so a release build never fails purely for lack of configuration.
+  FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
+  # Name of the single artifact bundle shared by the release and pages jobs.
+  RELEASE_ARTIFACT_NAME: 'harbor-release-assets'
+
+jobs:
+  build-apk:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/main_app
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      build_number: ${{ steps.version.outputs.build_number }}
+      sha256: ${{ steps.checksum.outputs.sha256 }}
+      size_bytes: ${{ steps.checksum.outputs.size_bytes }}
+      apk_path: ${{ steps.checksum.outputs.apk_path }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Preflight - required application files
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for required in pubspec.yaml lib/main.dart; do
+            if [ ! -f "$required" ]; then
+              echo "::error::Missing required file apps/main_app/${required}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::apps/main_app is not buildable; aborting release build."
+            exit 1
+          fi
+
+      - name: Resolve version, tag and build number
+        id: version
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          raw_version=""
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            raw_version="${VERSION_INPUT:-}"
+          else
+            raw_version="${REF_NAME:-}"
+          fi
+          raw_version="${raw_version#refs/tags/}"
+          raw_version="${raw_version#v}"
+
+          pubspec_version=""
+          if [ -f pubspec.yaml ]; then
+            pubspec_version="$(sed -nE 's/^version:[[:space:]]*([^[:space:]#]+).*/\1/p' pubspec.yaml | head -n1)"
+            pubspec_version="${pubspec_version%\"}"
+            pubspec_version="${pubspec_version#\"}"
+            pubspec_version="${pubspec_version%\'}"
+            pubspec_version="${pubspec_version#\'}"
+          fi
+
+          if [ -n "$raw_version" ]; then
+            version="$raw_version"
+            if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+              tag="v${version}"
+            else
+              tag="${REF_NAME}"
+            fi
+          else
+            # Tag was not parseable: fall back to the version declared in pubspec.yaml.
+            version="${pubspec_version%%+*}"
+            tag="v${version}"
+          fi
+
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Could not derive a valid semantic version (got '${version}')."
+            exit 1
+          fi
+
+          if [ "$version" != "${version#v}" ]; then
+            echo "::error::Version '${version}' still carries a leading v."
+            exit 1
+          fi
+
+          if [ -n "$pubspec_version" ]; then
+            tag_base="${version%%-*}"
+            tag_base="${tag_base%%+*}"
+            pub_base="${pubspec_version%%-*}"
+            pub_base="${pub_base%%+*}"
+            if [ "$pub_base" != "$tag_base" ]; then
+              echo "::warning::apps/main_app/pubspec.yaml declares '${pubspec_version}' but the release version is '${version}'."
+            fi
+          fi
+
+          # Monotonic build number derived from the workflow run; falls back to
+          # 1 for local/act runs where GITHUB_RUN_NUMBER is not injected.
+          build_number="${RUN_NUMBER:-1}"
+          if ! printf '%s' "$build_number" | grep -Eq '^[0-9]+$'; then
+            build_number=1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "build_number=${build_number}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved version=${version} tag=${tag} build_number=${build_number}"
+
+      - name: Set up Java ${{ env.JAVA_VERSION }} (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Resolve Flutter dependencies
+        run: flutter pub get
+
+      # Gate the release on static analysis and the test suite. Both run before
+      # the APK is built, so a broken build can never be published as a release.
+      #
+      # --fatal-warnings (rather than --fatal-infos): errors and warnings fail
+      # the build, while info-level style lints in the test sources do not block
+      # a release. The analysis_options.yaml promotions (unused_import,
+      # unawaited_futures, unused_element) still apply at their severities.
+      - name: Analyze
+        run: flutter analyze --fatal-warnings
+
+      - name: Run the test suite
+        run: flutter test --reporter expanded
+
+      - name: Resolve HARBOR_API_BASE_URL
+        id: api
+        shell: bash
+        env:
+          API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
+          FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
+        run: |
+          set -euo pipefail
+          api_base_url="${API_BASE_URL:-}"
+          if [ -z "$api_base_url" ]; then
+            api_base_url="${FALLBACK}"
+            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
+          fi
+          echo "api_base_url=${api_base_url}" >> "$GITHUB_OUTPUT"
+          echo "Using HARBOR_API_BASE_URL=${api_base_url}"
+
+      - name: Build release APK
+        shell: bash
+        env:
+          API_BASE_URL: ${{ steps.api.outputs.api_base_url }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          flutter build apk --release \
+            --build-number="${BUILD_NUMBER}" \
+            --dart-define=HARBOR_API_BASE_URL="${API_BASE_URL}"
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          staging="${GITHUB_WORKSPACE}/release-assets"
+          mkdir -p "$staging"
+          changelog="$staging/CHANGELOG.md"
+
+          rev="HEAD"
+          if git rev-parse -q --verify HEAD^ >/dev/null 2>&1; then
+            rev="HEAD^"
+          fi
+
+          previous_tag=""
+          if [ "$rev" != "HEAD" ]; then
+            previous_tag="$(git describe --tags --abbrev=0 "$rev" 2>/dev/null || true)"
+          fi
+
+          if [ -n "$previous_tag" ]; then
+            range="${previous_tag}..HEAD"
+          else
+            range="HEAD"
+          fi
+
+          {
+            echo "## Harbor ${VERSION}"
+            echo
+            if [ -n "$previous_tag" ]; then
+              echo "Changes since \`${previous_tag}\`:"
+            else
+              echo "Changes since the first commit:"
+            fi
+            echo
+            commits="$(git log --no-merges --pretty=format:'- %s (%h) - %an' "$range" || true)"
+            if [ -n "$commits" ]; then
+              printf '%s\n' "$commits"
+            else
+              echo "- No commit metadata available for range \`${range}\`."
+            fi
+            echo
+            echo "_Release tag: \`${TAG}\` - commit \`${GITHUB_SHA:-unknown}\`._"
+          } > "$changelog"
+
+          if [ ! -s "$changelog" ]; then
+            echo "::error::Generated changelog is empty."
+            exit 1
+          fi
+          echo "changelog_path=${changelog}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK, compute checksum and stage assets
+        id: checksum
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -f "$apk" ]; then
+            echo "::error::Expected APK at apps/main_app/${apk} was not produced."
+            find build -name '*.apk' -print 2>/dev/null || true
+            exit 1
+          fi
+
+          size_bytes="$(stat -c '%s' "$apk")"
+          if [ -z "$size_bytes" ] || [ "$size_bytes" -le 0 ]; then
+            echo "::error::APK is empty (size=${size_bytes:-0} bytes)."
+            exit 1
+          fi
+
+          sha256="$(sha256sum "$apk" | awk '{print $1}')"
+          if ! printf '%s' "$sha256" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::Computed SHA256 is not 64 lowercase hex characters: '${sha256}'."
+            exit 1
+          fi
+
+          staging="${GITHUB_WORKSPACE}/release-assets"
+          mkdir -p "$staging"
+          cp "$apk" "$staging/app-release.apk"
+          (
+            cd "$staging"
+            sha256sum app-release.apk > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          printf '%s\n' "$VERSION" > "$staging/version.txt"
+          printf '%s\n' "$TAG" > "$staging/tag.txt"
+
+          {
+            echo "sha256=${sha256}"
+            echo "size_bytes=${size_bytes}"
+            echo "apk_path=${staging}/app-release.apk"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "APK verified: ${size_bytes} bytes, sha256=${sha256}"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: release-assets
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-apk
+    if: ${{ needs.build-apk.result == 'success' && needs.build-apk.outputs.tag != '' && needs.build-apk.outputs.sha256 != '' && needs.build-apk.outputs.apk_path != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: release-assets
+
+      - name: Verify downloaded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for required in app-release.apk SHA256SUMS CHANGELOG.md; do
+            if [ ! -s "release-assets/${required}" ]; then
+              echo "::error::Artifact member release-assets/${required} is missing or empty."
+              exit 1
+            fi
+          done
+          ( cd release-assets && sha256sum -c SHA256SUMS )
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build-apk.outputs.tag }}
+          VERSION: ${{ needs.build-apk.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          prerelease_args=()
+          case "$TAG" in
+            *-*) prerelease_args+=(--prerelease) ;;
+          esac
+
+          if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; replacing its assets and notes."
+            gh release upload "$TAG" \
+              release-assets/app-release.apk \
+              release-assets/SHA256SUMS \
+              --repo "$REPOSITORY" \
+              --clobber
+            gh release edit "$TAG" \
+              --repo "$REPOSITORY" \
+              --title "Harbor ${VERSION}" \
+              --notes-file release-assets/CHANGELOG.md \
+              "${prerelease_args[@]}"
+          else
+            create_args=(
+              --repo "$REPOSITORY"
+              --title "Harbor ${VERSION}"
+              --notes-file release-assets/CHANGELOG.md
+            )
+            if [ "${EVENT_NAME}" = "workflow_dispatch" ] && ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+              create_args+=(--target "${COMMIT_SHA}")
+            fi
+            gh release create "$TAG" \
+              release-assets/app-release.apk \
+              release-assets/SHA256SUMS \
+              "${create_args[@]}" \
+              "${prerelease_args[@]}"
+          fi
+
+          echo "### Release ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SHA256 | \`${{ needs.build-apk.outputs.sha256 }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Size (bytes) | ${{ needs.build-apk.outputs.size_bytes }} |" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-pages:
+    name: Publish update manifest to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build-apk
+    if: ${{ needs.build-apk.result == 'success' && needs.build-apk.outputs.sha256 != '' && needs.build-apk.outputs.version != '' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: release-assets
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build Pages site and latest_version.json
+        shell: bash
+        env:
+          VERSION: ${{ needs.build-apk.outputs.version }}
+          TAG: ${{ needs.build-apk.outputs.tag }}
+          SHA256: ${{ needs.build-apk.outputs.sha256 }}
+          SIZE_BYTES: ${{ needs.build-apk.outputs.size_bytes }}
+          MIN_SUPPORTED_VERSION: ${{ vars.HARBOR_MIN_SUPPORTED_VERSION }}
+          REPOSITORY: ${{ github.repository }}
+          CHANGELOG_FILE: ${{ github.workspace }}/release-assets/CHANGELOG.md
+          SITE_DIR: ${{ github.workspace }}/site
+        run: |
+          set -euo pipefail
+
+          site="${SITE_DIR}"
+          rm -rf "$site"
+          mkdir -p "$site"
+
+          if ! printf '%s' "$SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::Refusing to publish: sha256 '${SHA256}' is not 64 lowercase hex characters."
+            exit 1
+          fi
+          if ! printf '%s' "$SIZE_BYTES" | grep -Eq '^[0-9]+$'; then
+            echo "::error::Refusing to publish: size_bytes '${SIZE_BYTES}' is not an integer."
+            exit 1
+          fi
+          if [ ! -s "$CHANGELOG_FILE" ]; then
+            echo "::error::Changelog file ${CHANGELOG_FILE} is missing or empty."
+            exit 1
+          fi
+
+          min_supported="${MIN_SUPPORTED_VERSION:-}"
+          if [ -z "$min_supported" ]; then
+            min_supported="$VERSION"
+          fi
+          export HARBOR_MIN_SUPPORTED_RESOLVED="$min_supported"
+
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+
+          repository = os.environ["REPOSITORY"]
+          tag = os.environ["TAG"]
+          with open(os.environ["CHANGELOG_FILE"], encoding="utf-8") as handle:
+              changelog = handle.read().strip()
+
+          published_at = (
+              datetime.datetime.now(datetime.timezone.utc)
+              .replace(microsecond=0)
+              .isoformat()
+              .replace("+00:00", ".000Z")
+          )
+
+          payload = {
+              "latest_version": os.environ["VERSION"],
+              "min_supported_version": os.environ["HARBOR_MIN_SUPPORTED_RESOLVED"],
+              "download_url": f"https://github.com/{repository}/releases/download/{tag}/app-release.apk",
+              "sha256": os.environ["SHA256"],
+              "size_bytes": int(os.environ["SIZE_BYTES"]),
+              "changelog": changelog,
+              "force_update": False,
+              "published_at": published_at,
+              "platform": "android",
+              "update_available": True,
+              "update_required": False,
+              "release_notes_url": f"https://github.com/{repository}/releases/tag/{tag}",
+          }
+
+          destination = os.path.join(os.environ["SITE_DIR"], "latest_version.json")
+          with open(destination, "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2, ensure_ascii=False)
+              handle.write("\n")
+          print(f"Wrote {destination}")
+          PY
+
+          if command -v jq >/dev/null 2>&1; then
+            jq empty "$site/latest_version.json"
+          else
+            echo "::warning::jq not found on the runner; validated with python3 json instead."
+          fi
+          python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8")); print("JSON OK", sys.argv[1])' "$site/latest_version.json"
+
+          cp release-assets/SHA256SUMS "$site/SHA256SUMS"
+
+          cat > "$site/index.html" <<'HTML'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1" />
+              <title>Harbor OTA update manifest</title>
+              <style>
+                body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 42rem; line-height: 1.6; padding: 0 1rem; }
+                code { background: #f2f2f2; padding: 0.1rem 0.3rem; border-radius: 4px; }
+              </style>
+            </head>
+            <body>
+              <h1>Harbor OTA update manifest</h1>
+              <p>
+                This GitHub Pages site publishes the frozen release manifest consumed by
+                <code>apps/update_server</code> and <code>apps/main_app</code>.
+              </p>
+              <ul>
+                <li><a href="./latest_version.json">latest_version.json</a> - the update-check contract</li>
+                <li><a href="./SHA256SUMS">SHA256SUMS</a> - checksums for the published release assets</li>
+              </ul>
+            </body>
+          </html>
+          HTML
+
+          if [ ! -s "$site/index.html" ] || [ ! -s "$site/latest_version.json" ]; then
+            echo "::error::Pages site is incomplete."
+            exit 1
+          fi
+
+          {
+            echo "### Pages manifest published"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| latest_version | \`${VERSION}\` |"
+            echo "| min_supported_version | \`${min_supported}\` |"
+            echo "| tag | \`${TAG}\` |"
+            echo "| size_bytes | ${SIZE_BYTES} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

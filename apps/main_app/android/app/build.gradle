@@ -1,0 +1,123 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    // The Flutter Gradle Plugin must be applied after the Android and Kotlin
+    // Gradle plugins, because it configures both of them (and, for release
+    // builds, enables R8 and appends its own ProGuard rules).
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+// ---------------------------------------------------------------------------
+// local.properties
+// ---------------------------------------------------------------------------
+// `flutter build` writes flutter.versionCode / flutter.versionName (and the
+// flutter.sdk path used by settings.gradle) into android/local.properties. The
+// file is generated, git-ignored, and absent on a bare `gradle` invocation, so
+// every read below has a literal fallback.
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')
+if (flutterVersionCode == null) {
+    flutterVersionCode = '1'
+}
+
+def flutterVersionName = localProperties.getProperty('flutter.versionName')
+if (flutterVersionName == null) {
+    flutterVersionName = '1.0.0'
+}
+
+// ---------------------------------------------------------------------------
+// Flutter SDK version pins
+// ---------------------------------------------------------------------------
+// dev.flutter.flutter-gradle-plugin registers a `flutter` extension carrying the
+// SDK-level defaults (compileSdk 34, minSdk 21, targetSdk 34, the NDK pin, and
+// the app version). Prefer those, but fall back to the literal Flutter 3.24.5
+// values if the extension is ever unavailable, so an IDE sync or a bare Gradle
+// run still configures instead of throwing MissingPropertyException.
+def flutterExtension = project.extensions.findByName('flutter')
+def flutterCompileSdk = flutterExtension != null ? flutterExtension.compileSdkVersion : 34
+def flutterMinSdk = flutterExtension != null ? flutterExtension.minSdkVersion : 21
+def flutterTargetSdk = flutterExtension != null ? flutterExtension.targetSdkVersion : 34
+// In Flutter 3.24.5 this resolves to "23.1.7779620"; the literal is the NDK that
+// the ubuntu-latest CI image already ships, used only if the extension is gone.
+def flutterNdkVersion = flutterExtension != null ? flutterExtension.ndkVersion : '26.1.10909125'
+
+// ---------------------------------------------------------------------------
+// Release signing
+// ---------------------------------------------------------------------------
+// key.properties holds the keystore path and passwords and is never committed.
+// When it is absent — pull requests, fork builds, local release builds — the
+// release build type falls back to the debug signing config below, so CI still
+// produces an installable APK rather than failing on a missing keystore.
+def keystorePropertiesFile = rootProject.file('key.properties')
+def keystoreProperties = new Properties()
+def hasReleaseSigning = keystorePropertiesFile.exists()
+if (hasReleaseSigning) {
+    keystorePropertiesFile.withReader('UTF-8') { reader ->
+        keystoreProperties.load(reader)
+    }
+}
+
+android {
+    namespace "com.harbor.main_app"
+    compileSdk flutterCompileSdk
+    // AGP only needs the NDK for native symbol stripping; keeping the pin in
+    // lock-step with Flutter means the CI image's NDK is used when present.
+    ndkVersion flutterNdkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    signingConfigs {
+        release {
+            // Only populate the release signing config when the secrets file
+            // exists; an empty config is never selected in that case.
+            if (hasReleaseSigning) {
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+                storeFile keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null
+                storePassword keystoreProperties['storePassword']
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.harbor.main_app"
+        minSdk flutterMinSdk
+        targetSdk flutterTargetSdk
+        versionCode flutterVersionCode.toInteger()
+        versionName flutterVersionName
+    }
+
+    buildTypes {
+        release {
+            // Signed with the real key when available, otherwise the debug key
+            // so an unsigned CI build still succeeds. Flutter's plugin enables
+            // minify/shrink for release on its own as well; setting them here is
+            // explicit and idempotent.
+            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
+            minifyEnabled true
+            shrinkResources true
+            // The Flutter plugin also appends flutter_proguard_rules.pro and
+            // proguard-rules.pro; `proguardFiles` is additive, so the rules
+            // below only ever widen what is kept.
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+flutter {
+    source '../..'
+}

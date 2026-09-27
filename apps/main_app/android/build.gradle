@@ -1,0 +1,26 @@
+// Harbor — root Gradle build for the Android host app.
+//
+// The root project owns no code of its own: it only centralises repositories
+// and redirects every module's build output into the shared ../build directory
+// that the Flutter tool inspects for the produced APK.
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+// Keep build artifacts in <flutter project>/build rather than android/build, so
+// `flutter build apk` finds them at the documented path.
+rootProject.buildDir = "../build"
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(":app")
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}

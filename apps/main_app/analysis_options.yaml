@@ -1,0 +1,42 @@
+# Analyzer configuration for the Harbor main app.
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    # No implicit `dynamic` downcasts — every narrowing must be written out,
+    # so a shape change in the update server's JSON fails at the cast rather
+    # than deep inside a computation.
+    strict-casts: true
+
+    # Every collection literal, return type and generic argument must be
+    # inferable without silently falling back to `dynamic`.
+    strict-inference: true
+
+    # NOTE: `strict-raw-types` is deliberately NOT enabled. The update-server
+    # JSON decoders in core/update_engine and core/agent validate untrusted
+    # payloads with `is Map` / `is List` pattern checks before casting, which is
+    # the idiomatic way to narrow `dynamic` JSON and is precisely what
+    # strict-raw-types reports on. Enabling it would force annotating types that
+    # are intentionally being *probed* rather than trusted.
+
+  errors:
+    # A dropped Future means lost work or a swallowed error in an async engine;
+    # treat it as a build failure rather than a hint.
+    unawaited_futures: error
+    # An unused import in a 1k-line engine file usually means a refactor left
+    # dead wiring behind.
+    unused_import: error
+    # Keep the public engine/agent API honest.
+    unused_element: warning
+
+  exclude:
+    - build/**
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+    - "**/*.mocks.dart"
+
+linter:
+  # The project relies on the package:flutter_lints/flutter.yaml baseline
+  # (which already enables ~120 rules, including prefer_final_locals,
+  # use_string_buffers, cancel_subscriptions and close_sinks) rather than
+  # re-listing rules that the baseline already covers.

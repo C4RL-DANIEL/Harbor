@@ -1,0 +1,36 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Android
+apps/main_app/android/local.properties
+apps/main_app/android/key.properties
+apps/main_app/android/.gradle/
+apps/main_app/android/captures/
+apps/main_app/android/gradle/wrapper/gradle-wrapper.jar
+
+# Update server runtime state (published releases + flag matrix)
+apps/update_server/data/
+apps/update_server/build/
+
+# Secrets — never commit these
+.env
+.env.*
+*.jks
+*.keystore
+key.properties
+
+# OS
+.DS_Store
+Thumbs.db

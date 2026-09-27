@@ -1,0 +1,393 @@
+name: Deploy Update Server
+
+# Deploys the Dart shelf server verification artifact and the Flutter Web admin
+# dashboard. Runs on pushes to main that touch the update server app or this
+# workflow, and on manual dispatch.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/update_server/**'
+      - '.github/workflows/deploy_update_server.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one GitHub Pages deployment may run at a time; queued runs wait rather
+# than cancelling a deploy that is already publishing.
+concurrency:
+  group: pages-update-server
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.24.5'
+  DART_SDK_VERSION: 'stable'
+  # Documented fallback used when HARBOR_API_BASE_URL is unset. This is the
+  # origin the web dashboard calls for the admin API.
+  FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
+  # Base href must start and end with a slash; /update-admin/ is the default.
+  ADMIN_BASE_HREF: '/update-admin/'
+  # Port for the compiled-server smoke test.
+  SMOKE_TEST_PORT: '8080'
+
+jobs:
+  verify-server:
+    name: Analyze and test update server
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/update_server
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Preflight - required server sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for required in pubspec.yaml bin/server.dart; do
+            if [ ! -f "$required" ]; then
+              echo "::error::Missing required file apps/update_server/${required}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::apps/update_server is incomplete; aborting verification."
+            exit 1
+          fi
+
+      - name: Set up Dart ${{ env.DART_SDK_VERSION }}
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_SDK_VERSION }}
+
+      - name: Resolve Dart dependencies
+        run: dart pub get
+
+      - name: Analyze (fatal infos and warnings)
+        run: dart analyze --fatal-infos --fatal-warnings
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d test ] && find test -name '*_test.dart' -print -quit | grep -q .; then
+            dart test
+          else
+            echo "::warning::No Dart tests found under apps/update_server/test; skipping dart test."
+          fi
+
+      - name: Server verification summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Update server verification"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| dart pub get | passed |"
+            echo "| dart analyze --fatal-infos --fatal-warnings | passed |"
+            echo "| dart test | passed or not configured |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-admin-web:
+    name: Build and deploy admin dashboard
+    runs-on: ubuntu-latest
+    needs: verify-server
+    if: ${{ needs.verify-server.result == 'success' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: apps/update_server
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Preflight - required web dashboard sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for required in pubspec.yaml lib/main.dart web/index.html; do
+            if [ ! -f "$required" ]; then
+              echo "::error::Missing required file apps/update_server/${required}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::The Flutter Web dashboard is not buildable; aborting."
+            exit 1
+          fi
+
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Resolve Flutter dependencies
+        run: flutter pub get
+
+      - name: Resolve web build settings
+        id: settings
+        shell: bash
+        env:
+          API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
+          FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
+          BASE_HREF: ${{ env.ADMIN_BASE_HREF }}
+        run: |
+          set -euo pipefail
+
+          api_base_url="${API_BASE_URL:-}"
+          if [ -z "$api_base_url" ]; then
+            api_base_url="${FALLBACK}"
+            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
+          fi
+
+          # Normalize the base href so an empty or malformed value cannot break
+          # the web build: it must start and end with a single slash.
+          base_href="${BASE_HREF:-}"
+          case "$base_href" in
+            /*) ;;
+            *) base_href="/${base_href}" ;;
+          esac
+          case "$base_href" in
+            */) ;;
+            *) base_href="${base_href}/" ;;
+          esac
+          if [ "$base_href" = "//" ] || [ -z "$base_href" ]; then
+            base_href="/update-admin/"
+          fi
+
+          {
+            echo "api_base_url=${api_base_url}"
+            echo "base_href=${base_href}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Web build settings: base_href=${base_href} api_base_url=${api_base_url}"
+
+      - name: Build Flutter Web dashboard
+        shell: bash
+        env:
+          API_BASE_URL: ${{ steps.settings.outputs.api_base_url }}
+          BASE_HREF: ${{ steps.settings.outputs.base_href }}
+        run: |
+          set -euo pipefail
+          flutter build web --release \
+            --base-href "${BASE_HREF}" \
+            --dart-define=HARBOR_API_BASE_URL="${API_BASE_URL}"
+
+      - name: Verify web build output
+        shell: bash
+        env:
+          BASE_HREF: ${{ steps.settings.outputs.base_href }}
+        run: |
+          set -euo pipefail
+          build_dir="build/web"
+          if [ ! -d "$build_dir" ]; then
+            echo "::error::Expected Flutter Web output at apps/update_server/${build_dir}."
+            exit 1
+          fi
+          for required in index.html flutter_bootstrap.js main.dart.js; do
+            if [ ! -s "${build_dir}/${required}" ]; then
+              echo "::error::Web build member ${build_dir}/${required} is missing or empty."
+              exit 1
+            fi
+          done
+          if ! grep -q "${BASE_HREF}" "${build_dir}/index.html"; then
+            echo "::warning::Built index.html does not contain the configured base href ${BASE_HREF}."
+          fi
+          echo "Web build verified at ${build_dir} ($(du -sh "$build_dir" | cut -f1))."
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/update_server/build/web
+
+      - name: Deploy admin dashboard to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Deployment summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          BASE_HREF: ${{ steps.settings.outputs.base_href }}
+          API_BASE_URL: ${{ steps.settings.outputs.api_base_url }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          {
+            echo "### Update server deployment"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Dashboard base href | \`${BASE_HREF}\` |"
+            echo "| API base URL | \`${API_BASE_URL}\` |"
+            echo "| Pages URL | ${PAGE_URL:-not deployed} |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-server-image:
+    name: Compile and smoke-test shelf server
+    runs-on: ubuntu-latest
+    needs: verify-server
+    # Manual dispatch always builds the binary; pushes only when the
+    # HARBOR_PUBLISH_IMAGE repository variable is exactly 'true'.
+    if: ${{ needs.verify-server.result == 'success' && (github.event_name == 'workflow_dispatch' || vars.HARBOR_PUBLISH_IMAGE == 'true') }}
+    defaults:
+      run:
+        working-directory: apps/update_server
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Dart ${{ env.DART_SDK_VERSION }}
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_SDK_VERSION }}
+
+      - name: Resolve Dart dependencies
+        run: dart pub get
+
+      - name: Compile shelf server to a native executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          dart compile exe bin/server.dart -o build/harbor-update-server
+          if [ ! -s build/harbor-update-server ]; then
+            echo "::error::Compiled server binary is missing or empty."
+            exit 1
+          fi
+          chmod +x build/harbor-update-server
+          ls -l build/harbor-update-server
+
+      - name: Smoke-test compiled server
+        shell: bash
+        env:
+          PORT: ${{ env.SMOKE_TEST_PORT }}
+        run: |
+          set -euo pipefail
+
+          binary="build/harbor-update-server"
+          state_dir="$(mktemp -d)"
+          log_file="$(mktemp)"
+
+          export HARBOR_ALLOW_DEV_TOKEN=true
+          export HARBOR_ADMIN_TOKEN=dev-smoke-test-token
+          export HARBOR_PORT="${PORT}"
+          export PORT="${PORT}"
+          export HARBOR_STATE_FILE="${state_dir}/state.json"
+
+          # Always tear the server down, even on early failure.
+          trap 'if [ -n "${server_pid:-}" ]; then kill "${server_pid}" 2>/dev/null || true; wait "${server_pid}" 2>/dev/null || true; fi' EXIT
+
+          "$binary" >"$log_file" 2>&1 &
+          server_pid=$!
+
+          ready=0
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "::error::Server exited before becoming ready."
+              cat "$log_file" || true
+              exit 1
+            fi
+            if curl --silent --fail --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null; then
+              ready=1
+              echo "Server ready after ${attempt} attempt(s)."
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::Server did not answer /health within 30 seconds."
+            cat "$log_file" || true
+            exit 1
+          fi
+
+          echo "--- GET /health ---"
+          curl --silent --show-error --fail --max-time 5 \
+            "http://127.0.0.1:${PORT}/health" | tee /tmp/harbor-health.json
+          echo
+
+          echo "--- GET /api/v1/update-check?version=1.0.0&platform=android ---"
+          curl --silent --show-error --fail --max-time 5 \
+            "http://127.0.0.1:${PORT}/api/v1/update-check?version=1.0.0&platform=android" \
+            | tee /tmp/harbor-update-check.json
+          echo
+
+          python3 - <<'PY'
+          import json
+          import sys
+
+          path = "/tmp/harbor-update-check.json"
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  payload = json.load(handle)
+          except (OSError, ValueError) as error:
+              print(f"::error::update-check response is not valid JSON: {error}")
+              sys.exit(1)
+
+          if not isinstance(payload, dict):
+              print("::error::update-check response is not a JSON object.")
+              sys.exit(1)
+
+          if "latest_version" not in payload:
+              print("::error::update-check response is missing 'latest_version'.")
+              sys.exit(1)
+
+          if "platform" in payload and payload["platform"] != "android":
+              print(f"::error::update-check returned platform {payload['platform']!r}, expected 'android'.")
+              sys.exit(1)
+
+          latest = payload["latest_version"]
+          if not isinstance(latest, str):
+              print(f"::error::latest_version must be a string, got {type(latest).__name__}.")
+              sys.exit(1)
+
+          print(f"Smoke test OK: latest_version={latest!r}")
+          PY
+
+      - name: Upload compiled server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-update-server-linux-x64
+          path: apps/update_server/build/harbor-update-server
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Server build summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="build/harbor-update-server"
+          if [ -s "$binary" ]; then
+            size_bytes="$(stat -c '%s' "$binary")"
+          else
+            size_bytes="not built"
+          fi
+          {
+            echo "### Compiled server artifact"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Binary | \`apps/update_server/${binary}\` |"
+            echo "| Size (bytes) | ${size_bytes} |"
+            echo "| Smoke test | /health + /api/v1/update-check |"
+            echo "| Trigger | \`${GITHUB_EVENT_NAME}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

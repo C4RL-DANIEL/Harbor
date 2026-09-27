@@ -1,0 +1,107 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- =====================================================================
+         Permissions — security-critical for the OTA self-update flow.
+         ===================================================================== -->
+
+    <!-- Metadata checks and artifact download from the update server. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+
+    <!-- Required by ota_update on Android 8+ to hand an APK to the system
+         package installer. Without it the install intent is rejected and the
+         plugin reports PERMISSION_NOT_GRANTED_ERROR. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+
+    <!-- Legacy external-storage access. Scoped to the last releases that still
+         honoured it, so the app does not request anything it cannot use. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+
+    <!-- =====================================================================
+         Package visibility (Android 11+).
+         ===================================================================== -->
+    <queries>
+        <!-- Flutter's own ProcessTextPlugin queries text-processing activities. -->
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Resolving the system package installer that ota_update opens for the
+             downloaded APK. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:mimeType="application/vnd.android.package-archive"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.INSTALL_PACKAGE"/>
+        </intent>
+    </queries>
+
+    <application
+        android:label="Harbor"
+        android:name="${applicationName}"
+        android:requestLegacyExternalStorage="true"
+        android:usesCleartextTraffic="true">
+        <!-- No android:icon is declared on purpose: the repository intentionally
+             ships no binary image assets, so the platform default icon is used.
+             Add android:icon here once real launcher raster assets exist. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Applies the normal window theme as soon as the process starts,
+                 so the Flutter surface is backed by the right window colour. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Do not delete: the Flutter tool uses this to generate
+             GeneratedPluginRegistrant.java. -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+
+        <!-- =================================================================
+             FileProvider required for the OTA install hand-off.
+
+             ota_update downloads the APK into the app's internal
+             files/ota_update directory and then shares it with the package
+             installer through FileProvider.getUriForFile(). The authority must
+             match the one the plugin resolves at runtime; the plugin defaults
+             to "<applicationId>.ota_update_provider", which is exactly what is
+             declared here.
+             ================================================================= -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.ota_update_provider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/provider_paths"/>
+        </provider>
+    </application>
+
+    <!-- SECURITY NOTE: android:usesCleartextTraffic="true" is required only
+         because the development default HARBOR_API_BASE_URL is plain HTTP
+         (http://10.0.2.2:8080). Production MUST serve releases over HTTPS and
+         replace this flag with a res/xml/network_security_config.xml that
+         pins the production host and forbids cleartext, referenced via
+         android:networkSecurityConfig. -->
+</manifest>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launch splash background for API 21+. `?android:colorBackground` follows
+     the active theme, so this resolves to white in light mode and black in
+     night mode (see values-night/styles.xml) without any bitmap asset. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="?android:colorBackground" />
+</layer-list>

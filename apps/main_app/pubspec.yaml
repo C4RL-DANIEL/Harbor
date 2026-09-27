@@ -1,0 +1,46 @@
+name: main_app
+description: >-
+  Harbor — end-user application with an on-device agentic model core
+  (Multi-Head Latent Attention, fine-grained Mixture of Experts, on-device LoRA
+  self-learning), an extended-thinking agent with subagent fan-out, and an OTA
+  update engine with dynamic feature-flag driven UI injection.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ---- OTA update engine -------------------------------------------------
+  # Native APK installation trigger.
+  ota_update: ^6.0.0
+
+  # ---- Networking / persistence -----------------------------------------
+  http: ^1.2.0
+  path_provider: ^2.1.3
+  shared_preferences: ^2.2.3
+
+  # ---- Integrity / versioning ------------------------------------------
+  crypto: ^3.0.3
+  pub_semver: ^2.1.4
+  convert: ^3.1.1
+
+  # ---- Universal file reading ------------------------------------------
+  archive: ^3.6.1
+  yaml: ^3.1.2
+  xml: ^6.5.0
+
+  # ---- Collections -----------------------------------------------------
+  collection: ^1.18.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

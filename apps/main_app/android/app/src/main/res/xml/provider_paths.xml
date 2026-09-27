@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Paths exposed by the OTA FileProvider (authority
+     ${applicationId}.ota_update_provider).
+
+     ota_update 6.0.0 downloads the APK into the app's internal
+     files/ota_update directory, which is covered by <files-path path="."/>.
+     The external-files and cache roots are exposed as well so the provider
+     keeps working if the download directory is ever switched, and to cover
+     path_provider's support/cache directories used by the Dart updater. -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-files-path name="external_files" path="." />
+    <cache-path name="cache" path="." />
+    <files-path name="files" path="." />
+</paths>

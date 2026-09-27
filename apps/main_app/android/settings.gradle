@@ -1,0 +1,43 @@
+// Harbor — Android Gradle settings (Flutter 3.24 declarative plugin form).
+//
+// This is the modern Flutter settings script: AGP and Kotlin are declared once
+// here and applied by the module scripts, and the Flutter Gradle plugin is
+// pulled in as an included build straight out of the Flutter SDK instead of
+// being resolved from a Maven repository.
+
+pluginManagement {
+    // `flutter build` writes flutter.sdk into android/local.properties. The
+    // assert fails fast with an actionable message when a developer opens the
+    // project before ever running the Flutter tool.
+    def flutterSdkPath = {
+        def properties = new Properties()
+        file("local.properties").withInputStream { properties.load(it) }
+        def flutterSdkPath = properties.getProperty("flutter.sdk")
+        assert flutterSdkPath != null, "flutter.sdk not set in local.properties"
+        return flutterSdkPath
+    }()
+
+    // The Flutter Gradle plugin (dev.flutter.flutter-gradle-plugin) lives inside
+    // the SDK checkout; including it as a build means no published artifact is
+    // needed and the plugin always matches the SDK that is running the build.
+    includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    // Bootstraps plugin resolution for Flutter's own plugin loader.
+    id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+    // Android Gradle Plugin 8.1.0: the version Flutter 3.24.5 templates target.
+    // It requires Gradle 8.0+ and Java 17, both of which the CI runner provides.
+    id "com.android.application" version "8.1.0" apply false
+    // Kotlin 1.9.22: compatible with AGP 8.1.x and Gradle 8.4; ships Kotlin
+    // metadata that R8 understands.
+    id "org.jetbrains.kotlin.android" version "1.9.22" apply false
+}
+
+include ":app"

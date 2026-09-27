@@ -1,0 +1,245 @@
+================================================================================
+HARBOR — DUAL-APP OTA / FEATURE-FLAG / ON-DEVICE-LEARNING ECOSYSTEM
+MASTER PROMPT & FROZEN INTERFACE CONTRACT
+================================================================================
+
+This file is the single source of truth for the monorepo. Every implementation
+detail in apps/main_app and apps/update_server MUST conform to the wire contract
+defined in section 4. Changing a field name in section 4 is a breaking change and
+requires bumping the API major version.
+
+--------------------------------------------------------------------------------
+1. SYSTEM OVERVIEW
+--------------------------------------------------------------------------------
+
+Two Flutter applications live in one repository:
+
+  A. apps/main_app      — end-user application (Android first, Material 3).
+                          Contains the on-device agentic model core (MLA
+                          attention, fine-grained MoE, on-device LoRA), the
+                          extended-thinking agent with subagent fan-out, and the
+                          OTA update engine with dynamic feature flags.
+
+  B. apps/update_server — dual-purpose. A shelf HTTP service (bin/server.dart)
+                          that publishes release metadata + the dynamic feature
+                          flag matrix, and a Flutter Web admin dashboard
+                          (lib/main.dart) that edits that state live.
+
+Data flow:
+
+  [Git tag v1.2.3]
+        |
+        v
+  build_and_release.yml --- builds APK, computes SHA256, publishes GH Release,
+        |                   generates latest_version.json -> GitHub Pages
+        v
+  latest_version.json  ----(fetched by)---->  update_server (metadata store)
+        |
+        |  GET /api/v1/update-check   (release metadata, min supported version)
+        |  GET /api/v1/flags           (feature matrix + dynamic layouts)
+        v
+  main_app UpdateService  ----> Force / Soft update UI
+  main_app FeatureFlagProvider -> show/hide dynamic UI modules
+  main_app LoRA trainer  <---- IdleSyncWorker posts adapter deltas back
+
+--------------------------------------------------------------------------------
+2. COMPONENT A — MAIN APP ARCHITECTURE
+--------------------------------------------------------------------------------
+
+lib/
+  main.dart
+    HarborApp (root MaterialApp, Material 3, light/dark from seed color)
+    Bootstrap sequence: initialize engines -> silent update check -> run app.
+    Dynamic module registry renders only modules whose feature flag is live.
+
+  core/engine/mla_attention.dart
+    MultiHeadLatentAttention — DeepSeek-V2/V3 style low-rank KV compression.
+      * q  = W_dq(W_uq x)              : query low-rank projection
+      * c_kv = W_dkv x                  : compressed latent KV (kvLoraRank)
+      * k_nope, v = W_uk(c_kv), W_uv(c_kv)
+      * k_pe = RoPE(W_kr x)             : decoupled rotary key (ropeHeadDim)
+      * kv cache stores ONLY c_kv + k_pe  (never full per-head K/V)
+    Cache accounting: bytesPerToken = (kvLoraRank + ropeHeadDim) * 4, versus
+    vanilla MHA 2 * numHeads * headDim * 4. Reports compressionRatio.
+
+  core/engine/fine_grained_moe.dart
+    FineGrainedMoE — DeepSeekMoE style routing.
+      * numSharedExperts always fire (sharedExpertCount)
+      * router scores = softmax(gate(x)); top-K routed experts selected
+      * routedWeight = normTopKProb ? score/sum(topK) : score
+      * aux-loss-free bias correction (expertBias) nudges load balance
+      * capacity factor + token dropping with residual passthrough
+      * reports ExpertLoadReport (per-expert token counts, balance entropy)
+
+  core/engine/on_device_lora.dart
+    LoRA adapter set (A: r x inFeatures, B: outFeatures x r), alpha/rank scale.
+      * forward(x) = (alpha/rank) * B(A(x))
+      * merge()/unmerge() into frozen base weights
+      * OnDeviceLoRATrainer: SGD/AdamW micro-steps over a replay buffer
+      * IdleTrainingScheduler: only trains when device is idle AND charging,
+        via idle + charging streams, thermal/battery guards, and a daily
+        compute budget. Persists adapter weights to disk through a pluggable
+        AdapterStore (JSON file store by default).
+
+  core/agent/extended_thinking.dart
+    ExtendedThinkingAgent — explicit Plan -> Execute -> Verify loop.
+      * Plan: model drafts numbered steps, each declaring required tool + args
+      * Execute: steps run through SubagentRunner, independent steps fan out
+      * Verify: an independent verifier pass scores each step; failed steps are
+        retried/replanned up to maxReplanCycles
+      * Emits an immutable ThinkingTrace (thoughts, tool calls, observations)
+        surfaced in the UI as a collapsible "thinking" panel.
+
+  core/agent/subagent_runner.dart
+    SubagentRunner — concurrent local task execution with a bounded worker pool.
+      * Built-in subagents: FileParsingSubagent, SystemCommandSubagent,
+        CodeVerificationSubagent
+      * Per-task timeout, cancellation, structured SubagentResult
+      * SystemCommandSubagent uses an allow-list; shell metacharacters rejected.
+
+  core/agent/file_readers.dart
+    UniversalFileReader — raw text, source code, binary headers (ELF/PE/Mach-O/
+    ZIP/PNG/JPEG/PDF/GZIP magic sniffing), archives (zip/tar via package:
+    archive), and structured data (json/yaml/csv/ini/properties/xml).
+
+  core/update_engine/update_service.dart
+    UpdateService — silent background check on launch, semver comparison via
+    pub_semver, force vs soft decision, streaming APK download to app support
+    dir, SHA256 verification, ota_update native install trigger.
+
+  core/update_engine/dynamic_feature_flag_provider.dart
+    FeatureFlagProvider (ChangeNotifier) — remote JSON matrix, remote default
+    overlay, typed getters (bool/string/int/double/list/map), local override
+    persistence, DynamicLayout schema (sections -> modules) for UI injection.
+
+  core/update_engine/widgets/update_dialog.dart
+    ForceUpdateDialog (barrierDismissible: false, PopScope canPop: false)
+    SoftUpdateBanner (dismissible) + DownloadProgressSheet.
+
+--------------------------------------------------------------------------------
+3. COMPONENT B — UPDATE SERVER ARCHITECTURE
+--------------------------------------------------------------------------------
+
+bin/server.dart
+  shelf + shelf_router service. Middleware: request logging, CORS (admin web
+  app is served from a different origin), JSON error trapping, ETag on GETs.
+  Routes:
+    GET  /health
+    GET  /api/v1/update-check?version=&platform=
+    GET  /api/v1/flags
+    GET  /api/v1/releases                  (admin list)
+    POST /api/v1/releases                  (admin publish metadata)
+    PUT  /api/v1/config/min-supported      (admin set min supported version)
+    POST /api/v1/config/force              (admin trigger forced update)
+    PUT  /api/v1/flags                     (admin replace/merge flag matrix)
+    GET  /admin/state                      (aggregate snapshot for dashboard)
+    GET  /latest_version.json              (GitHub-Pages-compatible artifact)
+  Admin mutations require header  X-Admin-Token: <ADMIN_TOKEN>.
+  State persists atomically to $HARBOR_STATE_FILE (default ./data/state.json).
+
+lib/main.dart
+  Flutter Web admin dashboard: release publisher form, min-supported-version
+  slider, force-update switch, live feature-flag editor with JSON layout
+  injection, and a live device-response preview.
+
+--------------------------------------------------------------------------------
+4. FROZEN WIRE CONTRACT  (do not rename)
+--------------------------------------------------------------------------------
+
+GET /api/v1/update-check?version=1.0.0&platform=android
+200 application/json
+{
+  "latest_version": "1.2.0",
+  "min_supported_version": "1.1.0",
+  "download_url": "https://github.com/OWNER/REPO/releases/download/v1.2.0/app-release.apk",
+  "sha256": "9f2c...64 hex chars...",
+  "size_bytes": 24891342,
+  "changelog": "• ...\n• ...",
+  "force_update": false,
+  "published_at": "2026-02-01T10:00:00.000Z",
+  "platform": "android",
+  "update_available": true,
+  "update_required": false,
+  "release_notes_url": "https://github.com/OWNER/REPO/releases/tag/v1.2.0"
+}
+
+  * update_required = (installed < min_supported_version) OR force_update flag.
+  * update_available = (installed < latest_version).
+  * When the server has no release for a platform, it returns HTTP 200 with
+    latest_version == min_supported_version == "0.0.0" and update_available
+    false, so the client never crashes on an empty server.
+  * Malformed `version` query -> 400 {"error": "..."}.
+
+GET /api/v1/flags
+200 application/json
+{
+  "version": 7,
+  "updated_at": "2026-02-01T10:00:00.000Z",
+  "flags": { "dynamic_ui": true, "labs.voice_mode": false },
+  "remote_defaults": { "dynamic_ui": true },
+  "layout": {
+    "sections": [
+      { "id": "home", "title": "Home", "order": 0,
+        "modules": [ { "id": "thinking_panel", "type": "thinking_panel",
+                       "flag": "agent.thinking", "order": 0,
+                       "props": { "collapsedByDefault": true } } ] }
+    ]
+  }
+}
+
+PUT /api/v1/flags
+X-Admin-Token: <token>
+{ "flags": {...}, "remote_defaults": {...}, "layout": {...}, "merge": true }
+200 { "ok": true, "version": 8 }
+
+POST /api/v1/releases
+X-Admin-Token: <token>
+{ "platform":"android", "version":"1.2.0", "min_supported_version":"1.1.0",
+  "download_url":"https://...", "sha256":"<64 hex>", "size_bytes":123,
+  "changelog":"...", "force_update":false, "release_notes_url":"https://..." }
+201 { "ok": true, "release": { ...stored release... } }
+
+PUT /api/v1/config/min-supported
+X-Admin-Token: <token>
+{ "platform":"android", "min_supported_version":"1.1.0", "force_update":false }
+200 { "ok": true }
+
+POST /api/v1/config/force
+X-Admin-Token: <token>
+{ "platform":"android", "force_update":true }
+200 { "ok": true }
+
+Errors are always JSON: { "error": "<message>" } with 400/401/404/500.
+
+--------------------------------------------------------------------------------
+5. BUILD & RELEASE PIPELINE
+--------------------------------------------------------------------------------
+
+.github/workflows/build_and_release.yml
+  Trigger: push tags matching v*.*.*
+  Steps: checkout -> Java 17 (temurin) -> Flutter 3.24.x stable -> pub get ->
+         (optional) dart-define injection of API base URL from repo variables ->
+         flutter build apk --release -> sha256sum of the APK ->
+         gh release create with APK + SHA256SUMS ->
+         generate latest_version.json -> deploy to GitHub Pages.
+  latest_version.json mirrors the /api/v1/update-check release payload so the
+  update server can be seeded directly from Pages.
+
+.github/workflows/deploy_update_server.yml
+  Trigger: push to main touching apps/update_server/**, plus manual dispatch.
+  Steps: test + analyze server -> build Flutter Web admin dashboard ->
+         deploy dashboard to Pages -> build/verify server container or artifact.
+
+--------------------------------------------------------------------------------
+6. ENGINEERING CONSTRAINTS
+--------------------------------------------------------------------------------
+
+  * Dart 3.5 / Flutter 3.24.5. Null-safety, sound types, no dynamic leakage.
+  * Explicit typed exceptions for every failure path. No bare catch-alls that
+    swallow errors silently; every catch either rethrows typed or logs + records.
+  * All I/O is injectable so engines are unit-testable without a device.
+  * No placeholder functions, no TODO-only bodies, no truncated comments.
+  * Material 3 widgets throughout (`useMaterial3: true`).
+  * Semver comparisons use package:pub_semver, never hand-rolled string compare.
+  * Secrets (admin token, API base URL) come from environment/dart-define only.
+================================================================================
