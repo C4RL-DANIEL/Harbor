@@ -58,20 +58,42 @@ class AdminApiClient {
   /// `GET /health`.
   Future<Map<String, Object?>> health() => _send('GET', '/health');
 
-  /// `GET /api/v1/flags`.
+  /// Reads [path], falling back to [staticPath] when the live server is not
+  /// hosted (a 404), so the dashboard still works against a static Pages site.
+  Future<Map<String, Object?>> _readWithStaticFallback({
+    required String path,
+    required String staticPath,
+    Map<String, String>? query,
+  }) async {
+    try {
+      return await _send('GET', path, query: query);
+    } on ApiException catch (error) {
+      if (error.statusCode != 404) {
+        rethrow;
+      }
+      return _send('GET', staticPath);
+    }
+  }
+
+  /// `GET /api/v1/flags`, falling back to the static `/api/v1/flags.json`.
   Future<FeatureFlagMatrix> fetchFlags() async {
-    final Map<String, Object?> json = await _send('GET', '/api/v1/flags');
+    final Map<String, Object?> json = await _readWithStaticFallback(
+      path: '/api/v1/flags',
+      staticPath: '/api/v1/flags.json',
+    );
     return FeatureFlagMatrix.fromJson(json);
   }
 
-  /// `GET /api/v1/update-check`.
+  /// `GET /api/v1/update-check`, falling back to the static
+  /// `/latest_version.json`. The static document is release-wide, so it ignores
+  /// the installed version; the caller compares versions itself.
   Future<UpdateCheckResponse> updateCheck({
     required String installedVersion,
     required String platform,
   }) async {
-    final Map<String, Object?> json = await _send(
-      'GET',
-      '/api/v1/update-check',
+    final Map<String, Object?> json = await _readWithStaticFallback(
+      path: '/api/v1/update-check',
+      staticPath: '/latest_version.json',
       query: <String, String>{
         'version': installedVersion,
         'platform': platform,

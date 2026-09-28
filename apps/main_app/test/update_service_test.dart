@@ -506,6 +506,101 @@ void main() {
   // 5. Dismissal persistence
   // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
+  // 4b. Static Pages manifest fallback
+  // ---------------------------------------------------------------------------
+
+  group('static manifest fallback', () {
+    test('404 on the live endpoint falls back to latest_version.json',
+        () async {
+      final List<String> requested = <String>[];
+      final UpdateService service = _makeService(
+        client: MockClient((http.Request request) async {
+          requested.add(request.url.path);
+          if (request.url.path == '/api/v1/update-check') {
+            return http.Response('not found', 404);
+          }
+          return http.Response(_checkBody(latest: '1.2.0', min: '1.0.0'), 200);
+        }),
+      );
+
+      final UpdateCheckResult result = await service.checkForUpdate();
+
+      expect(result.error, isNull);
+      expect(result.decision, UpdateDecision.softUpdate);
+      expect(result.release!.latestVersion, '1.2.0');
+      expect(requested, <String>['/api/v1/update-check', '/latest_version.json']);
+    });
+
+    test('the fallback manifest is fetched without query parameters', () async {
+      late http.Request captured;
+      final UpdateService service = _makeService(
+        client: MockClient((http.Request request) async {
+          if (request.url.path == '/api/v1/update-check') {
+            return http.Response('not found', 404);
+          }
+          captured = request;
+          return http.Response(_checkBody(), 200);
+        }),
+      );
+
+      await service.checkForUpdate();
+
+      expect(captured.method, 'GET');
+      expect(captured.url.path, '/latest_version.json');
+      expect(captured.url.queryParameters, isEmpty);
+      expect(captured.headers['Accept'], 'application/json');
+    });
+
+    test('a non-404 error does not trigger the fallback', () async {
+      final List<String> requested = <String>[];
+      final UpdateService service = _makeService(
+        client: MockClient((http.Request request) async {
+          requested.add(request.url.path);
+          return http.Response('boom', 500);
+        }),
+      );
+
+      final UpdateCheckResult result = await service.checkForUpdate();
+
+      expect(result.error, contains('500'));
+      expect(requested, <String>['/api/v1/update-check']);
+    });
+
+    test('both endpoints missing degrades to up to date with an error',
+        () async {
+      final UpdateService service = _makeService(
+        client: MockClient(
+            (http.Request request) async => http.Response('nope', 404)),
+      );
+
+      final UpdateCheckResult result = await service.checkForUpdate();
+
+      expect(result.decision, UpdateDecision.upToDate);
+      expect(result.error, contains('404'));
+      expect(result.release, isNull);
+    });
+
+    test('a forced fallback manifest still forces the update', () async {
+      final UpdateService service = _makeService(
+        client: MockClient((http.Request request) async {
+          if (request.url.path == '/api/v1/update-check') {
+            return http.Response('not found', 404);
+          }
+          return http.Response(
+            _checkBody(latest: '2.0.0', min: '1.5.0', force: true),
+            200,
+          );
+        }),
+      );
+
+      final UpdateCheckResult result = await service.checkForUpdate();
+
+      expect(result.decision, UpdateDecision.forceUpdate);
+      expect(result.isForced, isTrue);
+    });
+  });
+
   group('dismissal persistence', () {
     test('dismiss / isDismissed / clearDismissal round-trip', () async {
       final UpdateService service = _makeService(

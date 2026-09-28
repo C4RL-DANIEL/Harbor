@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "updated_at": "2026-09-28T12:00:00.000Z",
+  "flags": {
+    "dynamic_ui": true,
+    "agent.thinking": true,
+    "agent.subagents": true,
+    "labs.voice_mode": false,
+    "labs.lora_training": false
+  },
+  "remote_defaults": {
+    "dynamic_ui": true,
+    "agent.thinking": true,
+    "agent.subagents": true,
+    "labs.voice_mode": false,
+    "labs.lora_training": false
+  },
+  "layout": {
+    "sections": [
+      {
+        "id": "home",
+        "title": "Home",
+        "order": 0,
+        "modules": [
+          {
+            "id": "engine_status",
+            "type": "engine_status",
+            "flag": "",
+            "order": 0
+          },
+          {
+            "id": "thinking_panel",
+            "type": "thinking_panel",
+            "flag": "agent.thinking",
+            "order": 1,
+            "props": {
+              "collapsedByDefault": true
+            }
+          },
+          {
+            "id": "agent_console",
+            "type": "agent_console",
+            "flag": "agent.subagents",
+            "order": 2
+          },
+          {
+            "id": "file_inspector",
+            "type": "file_inspector",
+            "flag": "",
+            "order": 3
+          },
+          {
+            "id": "update_status",
+            "type": "update_status",
+            "flag": "",
+            "order": 4
+          },
+          {
+            "id": "feature_flags",
+            "type": "feature_flags",
+            "flag": "dynamic_ui",
+            "order": 5
+          }
+        ]
+      },
+      {
+        "id": "labs",
+        "title": "Labs",
+        "order": 1,
+        "modules": [
+          {
+            "id": "labs_announcement",
+            "type": "banner",
+            "flag": "labs.voice_mode",
+            "order": 0,
+            "props": {
+              "message": "Voice mode is enabled for this account.",
+              "severity": "info"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

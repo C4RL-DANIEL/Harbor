@@ -834,6 +834,97 @@ void main() {
   // 9. FlagValueType.of
   // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
+  // 10. Static Pages fallback
+  // ---------------------------------------------------------------------------
+
+  group('static fallback', () {
+    test('falls back to /api/v1/flags.json when the live endpoint 404s',
+        () async {
+      final List<String> requested = <String>[];
+      final FeatureFlagProvider provider = _provider(
+        client: MockClient((http.Request request) async {
+          requested.add(request.url.path);
+          if (request.url.path == '/api/v1/flags') {
+            return http.Response('not found', 404);
+          }
+          return http.Response(
+            _matrixJson(
+              version: 7,
+              flags: <String, Object?>{'labs': true},
+              layout: <String, Object?>{
+                'sections': <Object?>[
+                  <String, Object?>{
+                    'id': 'labs',
+                    'title': 'Labs',
+                    'order': 0,
+                    'modules': <Object?>[
+                      <String, Object?>{
+                        'id': 'lora_lab',
+                        'type': 'lora_lab',
+                        'flag': 'labs',
+                      },
+                    ],
+                  },
+                ],
+              },
+            ),
+            200,
+            headers: <String, String>{'content-type': 'application/json'},
+          );
+        }),
+      );
+
+      final FlagSyncResult result = await provider.refresh();
+
+      expect(result.ok, isTrue);
+      expect(result.updated, isTrue);
+      expect(result.source, 'network');
+      expect(provider.version, 7);
+      expect(provider.matrix.flags['labs'], isTrue);
+      expect(requested, <String>['/api/v1/flags', '/api/v1/flags.json']);
+    });
+
+    test('does not fall back on a non-404 error', () async {
+      final List<String> requested = <String>[];
+      final FeatureFlagProvider provider = _provider(
+        client: MockClient((http.Request request) async {
+          requested.add(request.url.path);
+          return http.Response('boom', 500);
+        }),
+      );
+
+      final FlagSyncResult result = await provider.refresh();
+
+      expect(result.ok, isFalse);
+      expect(requested, <String>['/api/v1/flags']);
+    });
+
+    test('keeps the built-in seed when both endpoints fail', () async {
+      const FeatureFlagMatrix seed = FeatureFlagMatrix(
+        version: 1,
+        updatedAt: null,
+        flags: <String, Object?>{'labs': false},
+        remoteDefaults: <String, Object?>{},
+        layout: DynamicLayout(sections: <DynamicSection>[]),
+      );
+      final FeatureFlagProvider provider = _provider(
+        client: MockClient((http.Request request) async =>
+            http.Response('offline', 404)),
+        seed: seed,
+      );
+
+      await provider.initialize();
+      final FlagSyncResult result = await provider.refresh();
+
+      expect(result.ok, isFalse);
+      expect(result.source, 'built-in');
+      expect(provider.version, 1);
+      expect(provider.matrix.flags['labs'], isFalse);
+      expect(provider.lastError, isNotNull);
+    });
+  });
+
   group('FlagValueType.of', () {
     test('classifies every JSON type including null', () {
       expect(FlagValueType.of(null), FlagValueType.nullValue);

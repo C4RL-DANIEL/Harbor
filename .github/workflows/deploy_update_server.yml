@@ -36,9 +36,9 @@ env:
   # compile. Using one SDK for both keeps the analyzer version identical to the
   # one that builds the web app.
   FLUTTER_VERSION: '3.24.5'
-  # Documented fallback used when HARBOR_API_BASE_URL is unset. This is the
-  # origin the web dashboard calls for the admin API.
-  FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
+  # Default origin the web dashboard calls for the admin API. When the variable
+  # is unset, the dashboard is pointed at the GitHub Pages site so it at least
+  # can read static flags; admins can override it in the dashboard UI.
   # Site-relative subdirectory the dashboard is served from. The absolute base
   # href passed to `flutter build web` is this value prefixed with the Pages
   # project path reported by actions/configure-pages (a project site is served
@@ -180,7 +180,7 @@ jobs:
         shell: bash
         env:
           API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
-          FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
+          REPO: ${{ github.repository }}
           ADMIN_SUBDIR: ${{ env.ADMIN_BASE_HREF }}
           PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
         run: |
@@ -188,8 +188,10 @@ jobs:
 
           api_base_url="${API_BASE_URL:-}"
           if [ -z "$api_base_url" ]; then
-            api_base_url="${FALLBACK}"
-            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
+            # No live update server is configured. Point the dashboard at the
+            # static Pages site by default; admins can still override it.
+            api_base_url="https://${REPO%%/*}.github.io/${REPO##*/}/"
+            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to Pages ${api_base_url}."
           fi
 
           # actions/configure-pages reports the path the site is served from:

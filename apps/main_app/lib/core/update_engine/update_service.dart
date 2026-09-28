@@ -479,6 +479,10 @@ class UpdateService {
 
   /// Performs a silent check against `GET /api/v1/update-check`.
   ///
+  /// When the server is not hosted, the same Pages site can publish a static
+  /// `latest_version.json`; if the live endpoint returns 404, this method falls
+  /// back to that file.
+  ///
   /// Never throws when [silent] is true: the failure is captured in
   /// [UpdateCheckResult.error] and the decision degrades to
   /// [UpdateDecision.upToDate] so app startup is never blocked by a network
@@ -486,32 +490,9 @@ class UpdateService {
   Future<UpdateCheckResult> checkForUpdate({bool silent = true}) async {
     final DateTime checkedAt = DateTime.now().toUtc();
     try {
-      final Uri uri = Uri.parse('$baseUrl/api/v1/update-check').replace(
-        queryParameters: <String, String>{
-          'version': currentVersion,
-          'platform': platform,
-        },
-      );
+      final ReleaseInfo release = await _fetchReleaseInfo();
 
-      final http.Response response = await _client.get(
-        uri,
-        headers: const <String, String>{'Accept': 'application/json'},
-      ).timeout(requestTimeout);
-
-      if (response.statusCode != 200) {
-        throw UpdateCheckException(
-          'update server returned an error',
-          statusCode: response.statusCode,
-        );
-      }
-
-      final ReleaseInfo release = ReleaseInfo.parse(
-        utf8.decode(response.bodyBytes),
-        platform: platform,
-      );
-
-      final Version latest =
-          release.latestSemver ?? _installedVersion;
+      final Version latest = release.latestSemver ?? _installedVersion;
       final Version minSupported =
           release.minSupportedSemver ?? release.latestSemver ?? _installedVersion;
 
@@ -586,6 +567,48 @@ class UpdateService {
         error: 'update check failed: $e',
       );
     }
+  }
+
+  /// Tries the live update-check endpoint, then the static manifest fallback.
+  Future<ReleaseInfo> _fetchReleaseInfo() async {
+    final Uri liveUri = Uri.parse('$baseUrl/api/v1/update-check').replace(
+      queryParameters: <String, String>{
+        'version': currentVersion,
+        'platform': platform,
+      },
+    );
+
+    final http.Response liveResponse = await _client.get(
+      liveUri,
+      headers: const <String, String>{'Accept': 'application/json'},
+    ).timeout(requestTimeout);
+
+    if (liveResponse.statusCode == 200) {
+      return ReleaseInfo.parse(
+        utf8.decode(liveResponse.bodyBytes),
+        platform: platform,
+      );
+    }
+
+    if (liveResponse.statusCode == 404) {
+      final Uri staticUri = Uri.parse('$baseUrl/latest_version.json');
+      final http.Response staticResponse = await _client.get(
+        staticUri,
+        headers: const <String, String>{'Accept': 'application/json'},
+      ).timeout(requestTimeout);
+
+      if (staticResponse.statusCode == 200) {
+        return ReleaseInfo.parse(
+          utf8.decode(staticResponse.bodyBytes),
+          platform: platform,
+        );
+      }
+    }
+
+    throw UpdateCheckException(
+      'update server returned an error',
+      statusCode: liveResponse.statusCode,
+    );
   }
 
   /// Streams the APK to disk while computing its SHA256, and verifies the

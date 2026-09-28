@@ -33,9 +33,6 @@ concurrency:
 env:
   FLUTTER_VERSION: '3.24.5'
   JAVA_VERSION: '17'
-  # Documented fallback used when the HARBOR_API_BASE_URL repository variable
-  # is unset, so a release build never fails purely for lack of configuration.
-  FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
   # Name of the single artifact bundle shared by the release and pages jobs.
   RELEASE_ARTIFACT_NAME: 'harbor-release-assets'
   # Site-relative subdirectory the dashboard is served from. The absolute base
@@ -233,27 +230,36 @@ jobs:
         shell: bash
         env:
           API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
-          FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           api_base_url="${API_BASE_URL:-}"
           if [ -z "$api_base_url" ]; then
-            api_base_url="${FALLBACK}"
-            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
+            # No live update server is configured. The client can fall back to
+            # the static manifest and flags published on GitHub Pages, so point
+            # it at the project Pages URL by default.
+            api_base_url="https://${REPO%%/*}.github.io/${REPO##*/}/"
+            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to Pages ${api_base_url}."
           fi
           echo "api_base_url=${api_base_url}" >> "$GITHUB_OUTPUT"
           echo "Using HARBOR_API_BASE_URL=${api_base_url}"
-
       - name: Build release APK
         shell: bash
         env:
           API_BASE_URL: ${{ steps.api.outputs.api_base_url }}
+          VERSION: ${{ steps.version.outputs.version }}
           BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
         run: |
           set -euo pipefail
+          # --build-name sets the APK's versionName, and HARBOR_APP_VERSION is
+          # what UpdateService compares against the server's latest_version.
+          # Setting only one of them would make a fresh v1.0.1 install report
+          # itself as the pubspec's 1.0.0 and prompt for its own update forever.
           flutter build apk --release \
+            --build-name="${VERSION}" \
             --build-number="${BUILD_NUMBER}" \
-            --dart-define=HARBOR_API_BASE_URL="${API_BASE_URL}"
+            --dart-define=HARBOR_API_BASE_URL="${API_BASE_URL}" \
+            --dart-define=HARBOR_APP_VERSION="${VERSION}"
 
       - name: Generate changelog
         id: changelog
@@ -483,15 +489,17 @@ jobs:
         shell: bash
         env:
           API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
-          FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
+          REPO: ${{ github.repository }}
           ADMIN_SUBDIR: ${{ env.ADMIN_BASE_HREF }}
           PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
         run: |
           set -euo pipefail
           api_base_url="${API_BASE_URL:-}"
           if [ -z "$api_base_url" ]; then
-            api_base_url="${FALLBACK}"
-            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
+            # No live update server is configured. Point the dashboard at the
+            # static Pages site by default; admins can still override it.
+            api_base_url="https://${REPO%%/*}.github.io/${REPO##*/}/"
+            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to Pages ${api_base_url}."
           fi
 
           # actions/configure-pages reports the path the site is served from:

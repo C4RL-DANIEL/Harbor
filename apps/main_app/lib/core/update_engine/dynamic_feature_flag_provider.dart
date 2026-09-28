@@ -549,6 +549,10 @@ class FeatureFlagProvider extends ChangeNotifier {
 
   /// Fetches `GET /api/v1/flags` and swaps in the new matrix.
   ///
+  /// If the live endpoint is missing (e.g. the update server is not hosted and
+  /// only GitHub Pages is available), the provider falls back to the static file
+  /// `/api/v1/flags.json` published to the same site.
+  ///
   /// On failure the previous matrix is retained and the error is recorded in
   /// [lastError]; the returned result reports `ok: false` rather than throwing,
   /// so callers can degrade silently.
@@ -564,25 +568,15 @@ class FeatureFlagProvider extends ChangeNotifier {
     _refreshing = true;
     _notify();
 
-    final Uri uri = Uri.parse('$baseUrl/api/v1/flags');
     try {
-      final http.Response response =
-          await _client.get(uri, headers: const <String, String>{
-        'Accept': 'application/json',
-      }).timeout(requestTimeout);
+      final FeatureFlagMatrix fetched = await _fetchMatrix();
 
-      if (response.statusCode != 200) {
-        throw FlagFetchException(
-          'update server rejected the flag request',
-          statusCode: response.statusCode,
-        );
-      }
-
-      final FeatureFlagMatrix fetched =
-          FeatureFlagMatrix.parse(utf8.decode(response.bodyBytes));
-
+      // `_lastSyncedAt` is only ever set after a successful network sync, so it
+      // is the right "never talked to the server in this session" marker. Using
+      // `_matrix.version == 0` instead would skip applying a server matrix whose
+      // version happens to equal the built-in seed's.
       final bool changed =
-          force || fetched.version != _matrix.version || _matrix.version == 0;
+          force || _lastSyncedAt == null || fetched.version != _matrix.version;
       if (changed) {
         _matrix = fetched;
         _source = 'network';
@@ -633,6 +627,37 @@ class FeatureFlagProvider extends ChangeNotifier {
       _refreshing = false;
       _notify();
     }
+  }
+
+  /// Tries the live flags endpoint, then the static `.json` fallback.
+  Future<FeatureFlagMatrix> _fetchMatrix() async {
+    final Uri liveUri = Uri.parse('$baseUrl/api/v1/flags');
+    final http.Response liveResponse = await _client
+        .get(liveUri, headers: const <String, String>{
+      'Accept': 'application/json',
+    }).timeout(requestTimeout);
+
+    if (liveResponse.statusCode == 200) {
+      return FeatureFlagMatrix.parse(utf8.decode(liveResponse.bodyBytes));
+    }
+
+    // The live server is optional. Pages-hosted sites publish a static fallback.
+    if (liveResponse.statusCode == 404) {
+      final Uri staticUri = Uri.parse('$baseUrl/api/v1/flags.json');
+      final http.Response staticResponse = await _client
+          .get(staticUri, headers: const <String, String>{
+        'Accept': 'application/json',
+      }).timeout(requestTimeout);
+
+      if (staticResponse.statusCode == 200) {
+        return FeatureFlagMatrix.parse(utf8.decode(staticResponse.bodyBytes));
+      }
+    }
+
+    throw FlagFetchException(
+      'update server rejected the flag request',
+      statusCode: liveResponse.statusCode,
+    );
   }
 
   Future<void> _persistMatrix(FeatureFlagMatrix matrix) async {

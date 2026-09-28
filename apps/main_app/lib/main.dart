@@ -36,6 +36,98 @@ import 'features/dynamic_module_registry.dart';
 /// Material 3 seed colour for the Harbor brand.
 const Color kHarborSeedColor = Color(0xFF2F6FED);
 
+/// Default feature-flag matrix used before any network sync succeeds.
+///
+/// It mirrors `apps/update_server/flags/default_flags.json`, which the Pages
+/// builder publishes as `/api/v1/flags.json`, so the app boots with a sensible
+/// layout even when no update server is hosted. Every `type` below must have a
+/// renderer in [DynamicModuleRegistry.defaultBuilders]; the client test suite
+/// asserts that, because an unregistered type renders a placeholder card
+/// instead of a working module.
+const FeatureFlagMatrix kDefaultFlagMatrix = FeatureFlagMatrix(
+  version: 1,
+  updatedAt: null,
+  flags: <String, Object?>{
+    'dynamic_ui': true,
+    'agent.thinking': true,
+    'agent.subagents': true,
+    'labs.voice_mode': false,
+    'labs.lora_training': false,
+  },
+  remoteDefaults: <String, Object?>{
+    'dynamic_ui': true,
+    'agent.thinking': true,
+    'agent.subagents': true,
+    'labs.voice_mode': false,
+    'labs.lora_training': false,
+  },
+  layout: DynamicLayout(
+    sections: <DynamicSection>[
+      DynamicSection(
+        id: 'home',
+        title: 'Home',
+        order: 0,
+        modules: <DynamicModule>[
+          DynamicModule(
+            id: 'engine_status',
+            type: 'engine_status',
+            flag: '',
+            order: 0,
+          ),
+          DynamicModule(
+            id: 'thinking_panel',
+            type: 'thinking_panel',
+            flag: 'agent.thinking',
+            order: 1,
+            props: <String, Object?>{'collapsedByDefault': true},
+          ),
+          DynamicModule(
+            id: 'agent_console',
+            type: 'agent_console',
+            flag: 'agent.subagents',
+            order: 2,
+          ),
+          DynamicModule(
+            id: 'file_inspector',
+            type: 'file_inspector',
+            flag: '',
+            order: 3,
+          ),
+          DynamicModule(
+            id: 'update_status',
+            type: 'update_status',
+            flag: '',
+            order: 4,
+          ),
+          DynamicModule(
+            id: 'feature_flags',
+            type: 'feature_flags',
+            flag: 'dynamic_ui',
+            order: 5,
+          ),
+        ],
+      ),
+      DynamicSection(
+        id: 'labs',
+        title: 'Labs',
+        order: 1,
+        modules: <DynamicModule>[
+          DynamicModule(
+            id: 'labs_announcement',
+            type: 'banner',
+            flag: 'labs.voice_mode',
+            order: 0,
+            props: <String, Object?>{
+              'message': 'Voice mode is enabled for this account.',
+              'severity': 'info',
+            },
+          ),
+        ],
+      ),
+    ],
+  ),
+);
+
 /// Compile-time configuration, supplied with `--dart-define`.
 @immutable
 class HarborConfig {
@@ -276,6 +368,7 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
   // ---- Update engine -----------------------------------------------------
   final FeatureFlagProvider flags = FeatureFlagProvider(
     baseUrl: config.apiBaseUrl,
+    seed: kDefaultFlagMatrix,
   );
   final UpdateService updateService = UpdateService(
     baseUrl: config.apiBaseUrl,

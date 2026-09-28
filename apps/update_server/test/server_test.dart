@@ -14,6 +14,7 @@ import 'dart:io';
 
 import 'package:test/test.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:pub_semver/pub_semver.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
@@ -654,6 +655,209 @@ void main() {
         headers: <String, String>{'if-none-match': flags.headers['etag']!},
       );
       expect(cached.statusCode, 304);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // AdminApiClient static fallback
+  // ---------------------------------------------------------------------------
+
+  group('admin client static fallback', () {
+    String flagsBody() => jsonEncode(<String, Object?>{
+          'version': 3,
+          'updated_at': '2026-09-28T12:00:00.000Z',
+          'flags': <String, Object?>{'dynamic_ui': true},
+          'remote_defaults': <String, Object?>{'dynamic_ui': true},
+          'layout': <String, Object?>{
+            'sections': <Object?>[
+              <String, Object?>{
+                'id': 'home',
+                'title': 'Home',
+                'order': 0,
+                'modules': <Object?>[
+                  <String, Object?>{
+                    'id': 'thinking_panel',
+                    'type': 'thinking_panel',
+                    'flag': 'agent.thinking',
+                  },
+                ],
+              },
+            ],
+          },
+        });
+
+    String manifestBody() => jsonEncode(<String, Object?>{
+          'latest_version': '1.2.0',
+          'min_supported_version': '1.1.0',
+          'download_url': 'https://cdn.test/app-release.apk',
+          'sha256': _shaA,
+          'size_bytes': 100,
+          'changelog': '',
+          'force_update': false,
+          'platform': 'android',
+          'update_available': true,
+          'update_required': false,
+          'published_at': '2026-09-28T12:00:00.000Z',
+          'release_notes_url': 'https://cdn.test/notes',
+        });
+
+    test('fetchFlags falls back to /api/v1/flags.json on 404', () async {
+      final List<String> requested = <String>[];
+      final AdminApiClient client = AdminApiClient(
+        baseUrl: 'https://static.test',
+        httpClient: MockClient((http.Request request) async {
+          requested.add(request.url.path);
+          if (request.url.path == '/api/v1/flags') {
+            return http.Response('not found', 404);
+          }
+          return http.Response(flagsBody(), 200);
+        }),
+      );
+      addTearDown(client.close);
+
+      final FeatureFlagMatrix matrix = await client.fetchFlags();
+
+      expect(matrix.version, 3);
+      expect(matrix.flags['dynamic_ui'], isTrue);
+      expect(requested, <String>['/api/v1/flags', '/api/v1/flags.json']);
+    });
+
+    test('updateCheck falls back to /latest_version.json on 404', () async {
+      final List<String> requested = <String>[];
+      final AdminApiClient client = AdminApiClient(
+        baseUrl: 'https://static.test',
+        httpClient: MockClient((http.Request request) async {
+          requested.add(request.url.path);
+          if (request.url.path == '/api/v1/update-check') {
+            return http.Response('not found', 404);
+          }
+          return http.Response(manifestBody(), 200);
+        }),
+      );
+      addTearDown(client.close);
+
+      final UpdateCheckResponse response = await client.updateCheck(
+        installedVersion: '1.0.0',
+        platform: 'android',
+      );
+
+      expect(response.latestVersion, '1.2.0');
+      expect(response.updateAvailable, isTrue);
+      expect(requested, <String>['/api/v1/update-check', '/latest_version.json']);
+    });
+
+    test('the static manifest is requested without query parameters', () async {
+      late http.Request captured;
+      final AdminApiClient client = AdminApiClient(
+        baseUrl: 'https://static.test/',
+        httpClient: MockClient((http.Request request) async {
+          if (request.url.path == '/api/v1/update-check') {
+            return http.Response('not found', 404);
+          }
+          captured = request;
+          return http.Response(manifestBody(), 200);
+        }),
+      );
+      addTearDown(client.close);
+
+      await client.updateCheck(installedVersion: '1.0.0', platform: 'android');
+
+      expect(captured.url.path, '/latest_version.json');
+      expect(captured.url.queryParameters, isEmpty);
+    });
+
+    test('a non-404 error is not silently swallowed', () async {
+      final List<String> requested = <String>[];
+      final AdminApiClient client = AdminApiClient(
+        baseUrl: 'https://static.test',
+        httpClient: MockClient((http.Request request) async {
+          requested.add(request.url.path);
+          return http.Response('boom', 500);
+        }),
+      );
+      addTearDown(client.close);
+
+      await expectLater(
+        client.fetchFlags(),
+        throwsA(isA<ApiException>()
+            .having((ApiException e) => e.statusCode, 'status', 500)),
+      );
+      expect(requested, <String>['/api/v1/flags']);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Static default flags published to GitHub Pages
+  // ---------------------------------------------------------------------------
+
+  group('static default flags', () {
+    late Map<String, Object?> document;
+
+    /// Every layout section in the document, as plain maps.
+    List<Map<String, Object?>> sectionsOf(FeatureFlagMatrix matrix) {
+      final Object? raw = matrix.layout['sections'];
+      if (raw is! List) {
+        return <Map<String, Object?>>[];
+      }
+      return raw
+          .whereType<Map<Object?, Object?>>()
+          .map((Map<Object?, Object?> s) => s.cast<String, Object?>())
+          .toList();
+    }
+
+    setUpAll(() {
+      final File file = File('flags/default_flags.json');
+      expect(
+        file.existsSync(),
+        isTrue,
+        reason: 'the Pages builder copies this file to /api/v1/flags.json',
+      );
+      final Object? decoded = jsonDecode(file.readAsStringSync());
+      document = (decoded! as Map<Object?, Object?>).cast<String, Object?>();
+    });
+
+    test('parses as a FeatureFlagMatrix', () {
+      final FeatureFlagMatrix matrix = FeatureFlagMatrix.fromJson(document);
+      expect(matrix.version, greaterThan(0));
+      expect(matrix.flags, isNotEmpty);
+    });
+
+    test('carries a layout the client can render', () {
+      final FeatureFlagMatrix matrix = FeatureFlagMatrix.fromJson(document);
+      final List<Map<String, Object?>> sections = sectionsOf(matrix);
+      expect(sections, isNotEmpty);
+      for (final Map<String, Object?> section in sections) {
+        expect(section['id'], isA<String>());
+        expect(section['title'], isA<String>());
+      }
+    });
+
+    test('every module flag is declared in the matrix', () {
+      final FeatureFlagMatrix matrix = FeatureFlagMatrix.fromJson(document);
+      final Set<String> declared = <String>{
+        ...matrix.flags.keys,
+        ...matrix.remoteDefaults.keys,
+      };
+      for (final Map<String, Object?> section in sectionsOf(matrix)) {
+        final Object? rawModules = section['modules'];
+        if (rawModules is! List) {
+          continue;
+        }
+        for (final Object? raw in rawModules) {
+          if (raw is! Map<Object?, Object?>) {
+            continue;
+          }
+          final Map<String, Object?> module = raw.cast<String, Object?>();
+          final Object? flag = module['flag'];
+          if (flag is String && flag.isNotEmpty) {
+            expect(
+              declared,
+              contains(flag),
+              reason: 'module ${module['id']} gates on an undeclared flag',
+            );
+          }
+        }
+      }
     });
   });
 

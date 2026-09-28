@@ -181,6 +181,28 @@ updateRequired  = (installed < minSupported) || forceUpdate
 | `HARBOR_VERBOSE_LOGGING` | `false` | Verbose engine/agent logging |
 | `HARBOR_AUTO_CHECK_UPDATES` | `true` | Silently check for updates on launch |
 
+#### Running without a hosted update server
+
+The server is optional. Both the client and the dashboard treat a **404 on a live endpoint as
+"this deployment is static"** and retry the equivalent file published to the same origin:
+
+| Live endpoint | Static fallback |
+| --- | --- |
+| `GET /api/v1/update-check?version=…` | `GET /latest_version.json` |
+| `GET /api/v1/flags` | `GET /api/v1/flags.json` |
+
+The release workflow defaults `HARBOR_API_BASE_URL` to the project's GitHub Pages URL
+(`https://<owner>.github.io/<repo>/`) when the repository variable is unset, so a build made
+with no configuration at all still checks for updates and syncs flags. Only a 404 triggers the
+fallback — a 5xx is reported as a real server error rather than silently masked.
+
+The client also ships a compiled-in `kDefaultFlagMatrix` (see `main.dart`) so the first frame
+already renders the correct layout with no network at all. Its module `type`s must exist in
+`DynamicModuleRegistry.defaultBuilders`; `dynamic_module_registry_test.dart` asserts that,
+because a mistyped type renders a placeholder card instead of a working module.
+`apps/update_server/flags/default_flags.json` is the same document, published to Pages as
+`/api/v1/flags.json`, and the server suite validates that copy.
+
 ---
 
 ## 3. Component B — the update server
@@ -213,6 +235,8 @@ the changelog. Contract guarantees:
 
 Both GET endpoints carry an `ETag`, and CORS is permissive for reads
 (`Access-Control-Allow-Origin: *`, `X-Admin-Token` and `Content-Type` allowed, `OPTIONS` → 204).
+When the server is not hosted, the same two documents are published as static files on Pages
+(`/latest_version.json` and `/api/v1/flags.json`); see §2.7.
 
 ### 3.2 Admin endpoints
 
@@ -230,6 +254,13 @@ update, and toggle flags live. Mutations are what the admin dashboard drives.
 `lib/main.dart` is a Flutter Web app that talks to the admin endpoints: edit the minimum
 supported version, publish release metadata, trigger a forced update and flip feature flags —
 all taking effect for clients on their next check, with no app release.
+
+Its base URL is a text field, so an admin can point it at any deployment; the build-time
+default comes from `HARBOR_API_BASE_URL`. The read paths share the client's fallback (a 404 on
+`/api/v1/flags` or `/api/v1/update-check` retries `/api/v1/flags.json` and
+`/latest_version.json`), so the dashboard still renders read-only data when it is pointed at the
+Pages site. Admin **mutations** need a live server; against a static host they fail with the
+server's own error, which the dashboard surfaces rather than swallowing.
 
 ### 3.4 `latest_version.json`
 
@@ -405,18 +436,20 @@ sources**, however, were available and were used directly — see below.
 
 - **Dart 3.5.4**, the exact SDK Flutter 3.24.5 bundles, was installed and used for every check
   below, so nothing rests on a newer SDK accepting syntax that 3.5.4 would reject.
-- **204 tests executed locally**: **170** covering the engine and agent layers — MLA (cache
+- **211 tests executed locally**: **170** covering the engine and agent layers — MLA (cache
   geometry, compression ratio, RoPE assertions), the MoE router (top-K selection, shared
   experts, capacity/dropping, aux-loss-free bias, balance entropy), LoRA (identity at init,
   merge/unmerge, learning a synthetic mapping, gradient clipping, replay bounds, JSON
   round-trip, every `IdleTrainingScheduler` gate), the universal file reader (magic-number
   sniffing, archives, structured formats, limits), the subagent runner (allow-list rejection,
   concurrency bounds, priority order, timeouts, cancellation, failures-as-values) and the
-  plan/execute/verify agent (DAG waves, verification verdicts, replanning) — plus **34**
+  plan/execute/verify agent (DAG waves, verification verdicts, replanning) — plus **41**
   covering the update server, driven through real HTTP over loopback: the zero payload,
   update-decision math (including pre-release ordering), validation, admin auth (401/503), flag
-  merging, `latest_version.json`, and the shutdown drain tracker.
-- On CI the full client suite runs: **260 tests**, widget tests included.
+  merging, `latest_version.json`, the admin client's static fallback, the published default flag
+  document, and the shutdown drain tracker.
+- On CI the full client suite runs, widget tests included, including the static-fallback and
+  registry-agreement tests that need `dart:ui` and therefore cannot execute here.
 - The **whole client tree — `lib/` *and* `test/`** — analyzes clean with
   `dart analyze --fatal-infos --fatal-warnings` under the repository's real
   `analysis_options.yaml`, resolving `package:flutter/material.dart` against the **real Flutter
@@ -507,6 +540,9 @@ found a third class: bugs that no amount of static analysis would have surfaced.
 | 16 | both workflows | the dashboard was built with `--base-href /update-admin/`, but a project Pages site is served from `/<repo>/`, so `index.html` loaded and **every asset 404'd**: `/update-admin/flutter_bootstrap.js` → 404 while `/Harbor/update-admin/flutter_bootstrap.js` → 200 | derive the absolute href from `actions/configure-pages`'s `base_path`, and stage the dashboard into only the last path segment so the artifact does not gain a second `/<repo>/` level |
 | 17 | `update_server/bin/server.dart` | the compiled server **never exited on SIGTERM**. The signal handlers ran and reported `state flushed`, but the `ProcessSignal` subscriptions keep the Dart event loop alive after `main()` returns, so the smoke test's `wait` blocked — the job sat *in progress* for 20+ minutes. Reproduced locally: the same probe returns from `wait` in 0.25 s with the fix and never returns without it | call `exit(0)` once the shutdown work has finished and stdout is flushed, and make the shutdown itself bounded (stop the listener → drain in-flight requests through the new `InFlightTracker` → force-close), so no step can stall the exit |
 | 18 | `deploy_update_server.yml` | the smoke test's teardown used an unbounded `wait`, which is what turned #17 into a hung runner | poll for up to 10 s, comparing `/proc` state (because `kill -0` also succeeds for a zombie), then escalate to `SIGKILL`; every job in both workflows also gets a `timeout-minutes` ceiling |
+| 19 | `build_and_release.yml`, `deploy_update_server.yml` | `FALLBACK_API_BASE_URL` was a **placeholder domain** (`https://harbor-update-server.example.com`). With `vars.HARBOR_API_BASE_URL` unset — the default state of a fresh clone — every release build baked that hostname into the APK, so the shipped app could never reach a server: `Failed host lookup: 'harbor-update-server.example.com' (OS Error: No address associated with hostname)`. The app degraded to built-in flags, but the update check silently never worked | default the variable to the project's Pages URL, computed from `github.repository`, and publish static `latest_version.json` / `api/v1/flags.json` there so every endpoint the client needs actually resolves |
+| 20 | `main.dart` | the built-in default layout named module types (`file_reader`, `lora_lab`) that are **not in `DynamicModuleRegistry`**, and gated modules on undeclared flags. An unregistered type does not vanish — it renders the "unsupported module" placeholder card, so the first screen of a fresh install was a row of dead cards, and a flag-gated module with no matching key is dropped entirely | rebuild the default layout from the registry's real types (`engine_status`, `thinking_panel`, `agent_console`, `file_inspector`, `update_status`, `feature_flags`, `banner`) and the canonical flag keys, and add `dynamic_module_registry_test.dart`, which asserts registry agreement, flag declaration and id uniqueness so this cannot regress |
+| 21 | `build_and_release.yml` | the APK was built with `--build-number` only. Neither `--build-name` nor `HARBOR_APP_VERSION` was passed, so **every** release shipped an APK whose `versionName` and self-reported version were the pubspec's `1.0.0`, while the manifest advertised the tag. A device that installed v1.0.1 would believe it was on 1.0.0, see `update_available: true` forever, and prompt for the update it had already installed | pass `--build-name="${VERSION}"` and `--dart-define=HARBOR_APP_VERSION="${VERSION}"`, so the APK metadata and the value the decision logic compares agree with the published manifest |
 
 ### Limits of this verification
 

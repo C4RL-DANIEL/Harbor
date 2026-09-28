@@ -234,6 +234,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Static feature flags endpoint
+# ---------------------------------------------------------------------------
+# When the update server is not hosted, the client can still fetch a default
+# flag matrix from the same Pages site. Both /api/v1/flags (the live endpoint)
+# and /api/v1/flags.json (the static fallback) are published so the client
+# can try the standard endpoint first and fall back to the .json file.
+flags_source="${repo_root}/apps/update_server/flags/default_flags.json"
+if [ -f "${flags_source}" ]; then
+  mkdir -p "${site_dir}/api/v1"
+  cp "${flags_source}" "${site_dir}/api/v1/flags.json"
+  # Duplicate as the extensionless path so a live-server-style URL also works.
+  cp "${flags_source}" "${site_dir}/api/v1/flags"
+  echo "Copied static feature flags from ${flags_source}"
+else
+  echo "::warning::No default feature flags found at ${flags_source}"
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Landing page
 # ---------------------------------------------------------------------------
 dashboard_link=""
@@ -244,6 +262,10 @@ manifest_link=""
 if [ "${manifest_written}" -eq 1 ]; then
   manifest_link="<li><a href=\"./latest_version.json\">latest_version.json</a> - the update-check contract</li>
                 <li><a href=\"./SHA256SUMS\">SHA256SUMS</a> - checksums for the published release assets</li>"
+fi
+flags_link=""
+if [ -f "${site_dir}/api/v1/flags.json" ]; then
+  flags_link="<li><a href=\"./api/v1/flags.json\">api/v1/flags.json</a> - the default feature-flag matrix, used by the app when no update server is hosted</li>"
 fi
 
 cat > "${site_dir}/index.html" <<HTML
@@ -269,6 +291,7 @@ cat > "${site_dir}/index.html" <<HTML
     <ul>
       ${dashboard_link}
       ${manifest_link}
+      ${flags_link}
     </ul>
   </body>
 </html>
@@ -285,6 +308,12 @@ if [ ! -s "${site_dir}/${admin_dir_name}/index.html" ]; then
   echo "::error::Pages site is incomplete: the dashboard is missing." >&2
   exit 1
 fi
+if [ ! -s "${site_dir}/api/v1/flags.json" ]; then
+  echo "::error::Pages site is incomplete: api/v1/flags.json is missing." >&2
+  exit 1
+fi
+python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8")); print("JSON OK", sys.argv[1])' \
+  "${site_dir}/api/v1/flags.json"
 
 echo "Pages site assembled at ${site_dir}:"
 ( cd "${site_dir}" && find . -maxdepth 1 -mindepth 1 -printf '  %f\n' | sort )
