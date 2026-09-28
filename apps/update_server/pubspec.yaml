@@ -29,10 +29,15 @@ dependencies:
   http: ^1.2.0
   intl: ^0.19.0
 
+  # ---- Browser bindings (lib/main.dart only) -----------------------------
+  # Replaces the deprecated dart:html for the web-only admin dashboard.
+  web: ^1.0.0
+
 dev_dependencies:
+  # `package:test` (not flutter_test) drives test/server_test.dart so the suite
+  # runs on the plain Dart VM via `dart test`. That is what proves lib/src/**
+  # and bin/server.dart stay Flutter-free.
   test: ^1.25.0
-  flutter_test:
-    sdk: flutter
   flutter_lints: ^4.0.0
 
 flutter:

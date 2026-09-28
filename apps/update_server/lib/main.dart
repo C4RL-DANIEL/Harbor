@@ -6,10 +6,14 @@
 // Build:  flutter build web --release --dart-define=HARBOR_API_BASE_URL=<url>
 
 import 'dart:convert';
-import 'dart:html' as html;
 
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:pub_semver/pub_semver.dart';
+// `package:web` is the supported replacement for the deprecated `dart:html`.
+// This dashboard only ever builds for Flutter Web, so it uses the browser DOM
+// bindings directly rather than a platform abstraction.
+import 'package:web/web.dart' as web;
 
 import 'src/admin_api_client.dart';
 import 'src/models.dart';
@@ -1662,7 +1666,7 @@ String _formatTimestamp(String? value) {
 
 String _readStored(String key, String fallback) {
   try {
-    final String? value = html.window.localStorage[key];
+    final String? value = web.window.localStorage.getItem(key);
     if (value == null || value.isEmpty) {
       return fallback;
     }
@@ -1674,7 +1678,7 @@ String _readStored(String key, String fallback) {
 
 void _writeStored(String key, String value) {
   try {
-    html.window.localStorage[key] = value;
+    web.window.localStorage.setItem(key, value);
   } catch (_) {
     // Storage may be unavailable in private browsing; settings stay in RAM.
   }

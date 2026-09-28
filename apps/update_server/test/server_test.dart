@@ -1,13 +1,17 @@
 // End-to-end and unit tests for the Harbor update server.
 //
-// The tests import `package:flutter_test` so they run under `flutter test` in
-// the real package; the pure-Dart verification mirror rewrites that import to
-// `package:test/test.dart`.
+// These tests deliberately depend on `package:test` rather than
+// `package:flutter_test`. Everything under test (bin/server.dart, lib/src/**)
+// is Flutter-free by design and must keep running on the plain Dart VM, so the
+// suite is executed with `dart test` — no Flutter test binding, no dart:ui.
+// The package still has a Flutter SDK dependency for lib/main.dart (the web
+// dashboard), which is why the workflow resolves dependencies with
+// `flutter pub get` before invoking `dart test`.
 
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter_test/flutter_test.dart';
+import 'package:test/test.dart';
 import 'package:http/http.dart' as http;
 import 'package:pub_semver/pub_semver.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;

@@ -44,9 +44,12 @@ def flutterExtension = project.extensions.findByName('flutter')
 def flutterCompileSdk = flutterExtension != null ? flutterExtension.compileSdkVersion : 34
 def flutterMinSdk = flutterExtension != null ? flutterExtension.minSdkVersion : 21
 def flutterTargetSdk = flutterExtension != null ? flutterExtension.targetSdkVersion : 34
-// In Flutter 3.24.5 this resolves to "23.1.7779620"; the literal is the NDK that
-// the ubuntu-latest CI image already ships, used only if the extension is gone.
-def flutterNdkVersion = flutterExtension != null ? flutterExtension.ndkVersion : '26.1.10909125'
+// Flutter 3.24.5 pins ndkVersion to "23.1.7779620" (the default NDK for the
+// AGP version it ships with). The literal below mirrors that value and is only
+// reached on a bare Gradle run where the Flutter plugin never registered the
+// extension; keeping the two identical means the fallback cannot silently
+// request a different NDK than a real `flutter build` would.
+def flutterNdkVersion = flutterExtension != null ? flutterExtension.ndkVersion : '23.1.7779620'
 
 // ---------------------------------------------------------------------------
 // Release signing

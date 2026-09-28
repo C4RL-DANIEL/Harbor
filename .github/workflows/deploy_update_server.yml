@@ -24,8 +24,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # apps/update_server has a `flutter: sdk: flutter` dependency (needed by
+  # lib/main.dart, the web dashboard), so `dart pub get` can never resolve it:
+  # pub refuses to resolve a package that requires the Flutter SDK. Every job
+  # below therefore installs Flutter and resolves with `flutter pub get`, then
+  # uses the Dart CLI bundled with that same Flutter SDK for analyze, test and
+  # compile. Using one SDK for both keeps the analyzer version identical to the
+  # one that builds the web app.
   FLUTTER_VERSION: '3.24.5'
-  DART_SDK_VERSION: 'stable'
   # Documented fallback used when HARBOR_API_BASE_URL is unset. This is the
   # origin the web dashboard calls for the admin API.
   FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
@@ -50,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for required in pubspec.yaml bin/server.dart; do
+          for required in pubspec.yaml bin/server.dart lib/main.dart; do
             if [ ! -f "$required" ]; then
               echo "::error::Missing required file apps/update_server/${required}"
               missing=1
@@ -61,13 +67,30 @@ jobs:
             exit 1
           fi
 
-      - name: Set up Dart ${{ env.DART_SDK_VERSION }}
-        uses: dart-lang/setup-dart@v1
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
         with:
-          sdk: ${{ env.DART_SDK_VERSION }}
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
 
-      - name: Resolve Dart dependencies
-        run: dart pub get
+      - name: Resolve dependencies (flutter pub get)
+        run: flutter pub get
+
+      # Architectural invariant: the HTTP service must stay runnable on a plain
+      # Dart VM with no Flutter engine. Only lib/main.dart (the web dashboard)
+      # may import Flutter, and nothing under bin/ or lib/src/ may.
+      - name: Verify server sources are Flutter-free
+        shell: bash
+        run: |
+          set -euo pipefail
+          offenders="$(grep -rln "package:flutter" bin lib/src || true)"
+          if [ -n "$offenders" ]; then
+            echo "::error::These server sources import Flutter and would break the headless Dart VM build:"
+            printf '%s\n' "$offenders"
+            exit 1
+          fi
+          echo "bin/ and lib/src/ are Flutter-free."
 
       - name: Analyze (fatal infos and warnings)
         run: dart analyze --fatal-infos --fatal-warnings
@@ -91,7 +114,8 @@ jobs:
             echo ""
             echo "| Check | Result |"
             echo "| --- | --- |"
-            echo "| dart pub get | passed |"
+            echo "| flutter pub get | passed |"
+            echo "| Flutter-free bin/ + lib/src/ | passed |"
             echo "| dart analyze --fatal-infos --fatal-warnings | passed |"
             echo "| dart test | passed or not configured |"
             echo "| Commit | \`${GITHUB_SHA}\` |"
@@ -254,19 +278,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Dart ${{ env.DART_SDK_VERSION }}
-        uses: dart-lang/setup-dart@v1
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
         with:
-          sdk: ${{ env.DART_SDK_VERSION }}
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
 
-      - name: Resolve Dart dependencies
-        run: dart pub get
+      - name: Resolve dependencies (flutter pub get)
+        run: flutter pub get
 
       - name: Compile shelf server to a native executable
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build
+          # bin/server.dart is Flutter-free, so it compiles on the pure Dart VM
+          # even though the package as a whole has a Flutter SDK dependency.
           dart compile exe bin/server.dart -o build/harbor-update-server
           if [ ! -s build/harbor-update-server ]; then
             echo "::error::Compiled server binary is missing or empty."
