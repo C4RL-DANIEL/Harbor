@@ -6,7 +6,7 @@ A production-grade, dual-app Flutter ecosystem in a single monorepo:
 | --- | --- | --- |
 | **Harbor** (client) | `apps/main_app` | A Flutter Android app with an on-device inference engine (MLA + fine-grained MoE + LoRA self-learning), an extended-thinking autonomous agent, a universal file reader, and a self-updating OTA engine. |
 | **Harbor Update Server** | `apps/update_server` | A Dart `shelf` service that serves release metadata, the dynamic feature-flag matrix, and a Flutter Web admin dashboard for publishing releases and flipping flags live. |
-| **Release pipeline** | `.github/workflows` | Tag-driven APK build → SHA256 → GitHub Release → `latest_version.json` → GitHub Pages, plus a server deploy pipeline. |
+| **Release pipeline** | `.github/workflows` | Tag-driven APK build → SHA256 → GitHub Release → `latest_version.json` → GitHub Pages, plus a server verify/deploy pipeline. Both pipelines are green on CI and have published `v1.0.0`; see [§7](#7-verification-status). |
 
 The frozen interface between the two apps — the HTTP wire contract, the feature-flag matrix schema and the release-metadata schema — is specified in [`MASTER_PROMPT.txt`](MASTER_PROMPT.txt) §4. Treat it as normative: the client parses exactly those shapes and the server emits exactly those shapes.
 
@@ -16,9 +16,11 @@ The frozen interface between the two apps — the HTTP wire contract, the featur
 
 ```
 .
-├── .github/workflows/
-│   ├── build_and_release.yml          # v*.*.* tag -> signed APK -> Release -> Pages
-│   └── deploy_update_server.yml       # CI for the server + admin web dashboard
+├── .github/
+│   ├── scripts/build_pages_site.sh     # assembles the complete Pages site (both pipelines)
+│   └── workflows/
+│       ├── build_and_release.yml       # v*.*.* tag -> signed APK -> Release -> Pages
+│       └── deploy_update_server.yml    # CI for the server + admin web dashboard
 ├── apps/
 │   ├── main_app/                      # the Flutter client ("Harbor")
 │   │   ├── android/                   # platform scaffolding (Gradle 8.4 / AGP 8.1 / Kotlin 1.9.22)
@@ -45,7 +47,7 @@ The frozen interface between the two apps — the HTTP wire contract, the featur
 │       ├── bin/server.dart            # entrypoint (plain Dart VM, no Flutter)
 │       ├── lib/
 │       │   ├── main.dart              # Flutter shell for the Web admin dashboard
-│       │   └── src/                   # models, release_store, api_router (no Flutter imports)
+│       │   └── src/                   # models, release_store, api_router, lifecycle (no Flutter)
 │       ├── test/
 │       ├── web/
 │       └── pubspec.yaml
@@ -231,9 +233,12 @@ all taking effect for clients on their next check, with no app release.
 
 ### 3.4 `latest_version.json`
 
-The release pipeline publishes `latest_version.json` to GitHub Pages containing every
-`update-check` field plus `generated_at`, so the server (or a static host) can be seeded
-directly from the release artifact.
+Both the server route `GET /latest_version.json` and the release pipeline's Pages artifact use
+this name, and both carry exactly the §4 release fields. The server adds one extra field,
+`generated_at`, because it regenerates the document per request and a consumer wants to know how
+fresh it is; the Pages artifact is a static file for a specific release, so it is timestamped by
+its `published_at` instead. `generated_at` is additive — the frozen contract is unchanged, and
+nothing requires the field to be present.
 
 ---
 
@@ -247,10 +252,23 @@ directly from the release artifact.
 3. `flutter build apk --release` with the version derived from the tag.
 4. Compute the APK's SHA256 and emit `SHA256SUMS`, `CHANGELOG.md`, `version.txt`, `tag.txt`.
 5. Create the GitHub Release and upload the APK plus checksums.
-6. Generate `latest_version.json` and deploy it to **GitHub Pages**.
+6. Assemble `latest_version.json` and deploy it to **GitHub Pages**.
 
 The `update-check` response points at that release, so the whole loop is: tag → APK → metadata
 → every installed client sees the update on next launch.
+
+`actions/deploy-pages` replaces the **whole** site with the uploaded artifact, and the spec has
+two pipelines deploying to it: this one owns `latest_version.json`, `deploy_update_server.yml`
+owns the admin dashboard. Publishing only its own half would mean whichever ran last deleted the
+other's files — a dashboard deploy 404s the manifest, a release 404s the dashboard. Both
+workflows therefore call `.github/scripts/build_pages_site.sh` and each publishes the complete
+site: the dashboard plus the manifest, with the manifest built from this workflow's build
+outputs or, in the server workflow, reconstructed from the published GitHub Release.
+
+The dashboard's absolute base href is derived from the Pages project path reported by
+`actions/configure-pages`, because a project site is served from `/<repo>/`. Hard-coding
+`/update-admin/` produced a dashboard whose `index.html` loaded but whose every asset was
+requested from the domain root and 404'd.
 
 The workflow also has a `workflow_dispatch` trigger taking `version` and a boolean `dry_run`.
 `dry_run: true` runs steps 1–4 only and skips the Release and the Pages deploy, which is how
@@ -258,6 +276,10 @@ the APK build and the widget tests get verified on CI *without* cutting a tag. T
 because `flutter analyze` treats info-level lints as fatal by default
 (`flutter_tools/lib/src/commands/analyze.dart` defaults `--fatal-infos` to `true`), so the
 analysis gate is stricter than it may look.
+
+`apps/main_app/android/build.gradle` pins NDK `23.1.7779620` (the Flutter 3.24.5 default), but
+the `ubuntu-latest` image ships only NDK 27/28/29, so the workflow installs the pinned revision
+with `sdkmanager` before building rather than depending on AGP's implicit download.
 
 Release-shape inputs come from repository **variables** (not secrets):
 `HARBOR_API_BASE_URL`, `HARBOR_MIN_SUPPORTED_VERSION`, `HARBOR_PUBLISH_IMAGE`. Only
@@ -269,15 +291,19 @@ Release-shape inputs come from repository **variables** (not secrets):
 
 ### `deploy_update_server.yml`
 
-Verifies the server, builds the Flutter Web admin dashboard to Pages
-(`base-href /update-admin/`), and optionally publishes a server binary artifact (gated on
-`workflow_dispatch` or `vars.HARBOR_PUBLISH_IMAGE == 'true'`).
+Verifies the server, publishes the admin dashboard to Pages, and optionally builds a server
+binary artifact (gated on `workflow_dispatch` or `vars.HARBOR_PUBLISH_IMAGE == 'true'`).
 
 The verify job installs Flutter and resolves with `flutter pub get`, then runs
 `dart analyze --fatal-infos --fatal-warnings` and `dart test` using the Dart CLI from that same
 Flutter SDK. Using one SDK for both keeps the analyzer version identical to the one that builds
 the web app, and running the server suite on the plain Dart VM via `dart test` (rather than
 `flutter test`) is what demonstrates the headless claim.
+
+The publish job compiles `bin/server.dart` to a native executable, starts it, polls `/health`,
+exercises `/api/v1/update-check`, and tears it down. The teardown is bounded: `wait` has no
+timeout of its own, so a server that ignores `SIGTERM` would hold the runner until the job
+timeout — see bug 17 below.
 
 ---
 
@@ -358,8 +384,13 @@ Everything under `bin/` and `lib/src/` is Flutter-free by design, which is what 
 with a `grep` gate so it cannot rot.
 
 The admin dashboard is served from `build/web` when it exists, and otherwise the server
-answers with a JSON landing page (so a bare server is still self-describing). Shutdown is
-graceful on `SIGINT`/`SIGTERM`.
+answers with a JSON landing page (so a bare server is still self-describing).
+
+Shutdown on `SIGINT`/`SIGTERM` is bounded and guaranteed to terminate: the listener stops, the
+`InFlightTracker` middleware gives requests already being served up to five seconds to finish,
+whatever is left is force-closed, state is flushed, and the process then calls `exit(0)`. That
+last step is not optional — the signal subscriptions keep the Dart event loop alive after
+`main()` returns, so without it the process lingers (bug 17 below).
 
 ---
 
@@ -374,18 +405,18 @@ sources**, however, were available and were used directly — see below.
 
 - **Dart 3.5.4**, the exact SDK Flutter 3.24.5 bundles, was installed and used for every check
   below, so nothing rests on a newer SDK accepting syntax that 3.5.4 would reject.
-- **200 tests pass**:
-  - **170** covering the engine and agent layers — MLA (cache geometry, compression ratio,
-    RoPE assertions), the MoE router (top-K selection, shared experts, capacity/dropping,
-    aux-loss-free bias, balance entropy), LoRA (identity at init, merge/unmerge, learning a
-    synthetic mapping, gradient clipping, replay bounds, JSON round-trip, every
-    `IdleTrainingScheduler` gate), the universal file reader (magic-number sniffing, archives,
-    structured formats, limits), the subagent runner (allow-list rejection, concurrency
-    bounds, priority order, timeouts, cancellation, failures-as-values) and the
-    plan/execute/verify agent (DAG waves, verification verdicts, replanning).
-  - **30** covering the update server, driven through real HTTP over loopback: the zero
-    payload, update-decision math (including pre-release ordering), validation, admin auth
-    (401/503), flag merging, and `latest_version.json`.
+- **204 tests executed locally**: **170** covering the engine and agent layers — MLA (cache
+  geometry, compression ratio, RoPE assertions), the MoE router (top-K selection, shared
+  experts, capacity/dropping, aux-loss-free bias, balance entropy), LoRA (identity at init,
+  merge/unmerge, learning a synthetic mapping, gradient clipping, replay bounds, JSON
+  round-trip, every `IdleTrainingScheduler` gate), the universal file reader (magic-number
+  sniffing, archives, structured formats, limits), the subagent runner (allow-list rejection,
+  concurrency bounds, priority order, timeouts, cancellation, failures-as-values) and the
+  plan/execute/verify agent (DAG waves, verification verdicts, replanning) — plus **34**
+  covering the update server, driven through real HTTP over loopback: the zero payload,
+  update-decision math (including pre-release ordering), validation, admin auth (401/503), flag
+  merging, `latest_version.json`, and the shutdown drain tracker.
+- On CI the full client suite runs: **260 tests**, widget tests included.
 - The **whole client tree — `lib/` *and* `test/`** — analyzes clean with
   `dart analyze --fatal-infos --fatal-warnings` under the repository's real
   `analysis_options.yaml`, resolving `package:flutter/material.dart` against the **real Flutter
@@ -403,18 +434,28 @@ sources**, however, were available and were used directly — see below.
 
 ### Proven on GitHub Actions
 
-The first runs were not a formality — they failed, and fixing them is what the second table
-below records. Current state:
+The first runs were not a formality — they failed, and fixing them is what the tables below
+record. The pipeline now runs green end to end, including a real, published release. Every claim
+in this section is an observed result, not a prediction:
 
 | Workflow / job | Result |
 | --- | --- |
-| `deploy_update_server.yml` → *Analyze and test update server* | **passes** — `flutter pub get`, the Flutter-free gate, `dart analyze --fatal-infos --fatal-warnings`, and `dart test` (30 tests) |
-| `deploy_update_server.yml` → *Build and deploy admin dashboard* | `flutter build web --release` **passes**; the Pages publish step failed only because Pages was not enabled on the repository |
-| `build_and_release.yml` → *Build release APK* | reaches `flutter pub get` successfully; the analysis gate then failed on 35 info-level lints, now fixed |
-| `build_and_release.yml` → *Release* / *Pages* | correctly **skipped** under `dry_run` |
+| `build_and_release.yml` → *Build release APK* | **passes** — `flutter analyze --fatal-infos --fatal-warnings`, **260 tests**, `flutter build apk --release` (24.1 MB / 24,079,567 bytes), SHA256 + `SHA256SUMS`, artifact upload |
+| `build_and_release.yml` → *Publish GitHub Release* | **passes** — created release `v1.0.0` with `app-release.apk` and `SHA256SUMS` |
+| `build_and_release.yml` → *Publish update manifest to GitHub Pages* | **passes** — assembled the complete site and deployed it |
+| `deploy_update_server.yml` → *Analyze and test update server* | **passes** — `flutter pub get`, the Flutter-free gate, `dart analyze --fatal-infos --fatal-warnings`, **34 tests** via `dart test` |
+| `deploy_update_server.yml` → *Build and deploy admin dashboard* | **passes** — `flutter build web --release` and the Pages deploy |
+| `deploy_update_server.yml` → *Compile and smoke-test shelf server* | **passes** — `dart compile exe`, `/health` + `/api/v1/update-check` over real HTTP, clean SIGTERM teardown |
 
-GitHub Pages is now enabled on the repository with `build_type: workflow`, so neither deploy
-depends on a manual settings change any more.
+The published artifacts are live and were verified over HTTP after the fact:
+
+| Artifact | Check |
+| --- | --- |
+| `https://c4rl-daniel.github.io/Harbor/latest_version.json` | returns the frozen §4 payload: `latest_version 1.0.0`, `update_available true`, `update_required false`, `size_bytes 24079567` |
+| `…/Harbor/SHA256SUMS` | `bffab2bf…c44bf  app-release.apk` |
+| Release asset `app-release.apk` | downloaded and hashed locally → `bffab2bf…c44bf`, identical to both the checksum file and the manifest, so the integrity chain the client walks is real |
+| `…/Harbor/update-admin/` | `base href="/Harbor/update-admin/"`, and `main.dart.js` / `flutter_bootstrap.js` return 200 |
+| Landing page | links all three artifacts, and the dashboard is *still* served after a release deploy rewrote the site |
 
 ### Bugs this process found and fixed
 
@@ -451,22 +492,37 @@ faithful — the real Flutter framework as a `path` dependency, with the SDK-sou
 reproduced CI's findings exactly, including the same 35 issues at the same line and column,
 which is what made them safe to fix locally.
 
-### Still not verified here — the next CI run is authoritative
+Finally, the first *executed* runs — the first `flutter test` and the first `assembleRelease` —
+found a third class: bugs that no amount of static analysis would have surfaced.
 
-- `flutter test` (executing the 11 widget tests) and `flutter build apk --release` have not yet
-  run to completion. The analysis gate that previously blocked them now passes, so the next
-  dispatch or tag reaches them.
-- The widget tests are compile-verified and were audited for the usual runtime traps: they pump
-  `MaterialApp` wrappers rather than the real app, use hand-written fakes and a `MockClient`
-  (no plugins, no network, no `Platform`/`dart:io` branching), and their two `pumpAndSettle`
-  calls wrap a dialog route transition over static content, so they should settle.
-- The APK build is the remaining unknown: R8 with `shrinkResources` under
-  `android/app/proguard-rules.pro`, and whether the runner provides NDK `23.1.7779620`.
-- `apps/update_server/lib/main.dart` compiles (`flutter build web` passed on CI) but has never
-  been *run*.
+| # | Where | Problem | Fix |
+| --- | --- | --- | --- |
+| 9 | `dynamic_feature_flag_provider.dart` | the documented public `changes` broadcast stream **never emitted**: `_notify()` only called `notifyListeners()`, nothing ever added to the controller, yet `dispose()` closed it | add `_emitChange()` and call it from the three sites that actually replace the matrix (cache restore, seed install, network refresh), so a subscriber sees one event per change |
+| 10 | `test/update_widgets_test.dart` | the test asserted `Navigator.maybePop()` returns `false` for a vetoed pop. It returns **`true`** — `RoutePopDisposition.doNotPop` is still a *handled* request — so the assertion tested the wrong thing while the app was correct | assert that the dialog survived instead of asserting the return value |
+| 11 | `test/feature_flags_test.dart` | the `describe()` test called only `initialize()`, which by design never fetches, so `matrix_version` stayed `0` | call `refresh()` too, which is what the app does at startup |
+| 12 | `android/build.gradle` | `assembleRelease` died in `:ota_update:verifyReleaseResources` with `AAPT: error: resource android:attr/lStar not found`. Flutter plugins are independent Gradle modules: `ota_update` 6.0.0 still declares `compileSdkVersion 28` while depending on a modern `androidx.core` whose resources reference an API-31 attribute, and AAPT resolves resources against the *module's* SDK | align every Android module's `compileSdk` with the app's, read back from `:app` so no second SDK number is hard-coded |
+| 13 | `android/build.gradle` | the first version of that alignment registered its `afterEvaluate` hook **below** `subprojects { evaluationDependsOn(":app") }`, which had already forced `:app` to evaluate — Gradle refuses that with *"Cannot run Project.afterEvaluate(Closure) when the project is already evaluated"* | register the hook at the top of the script, which is also what makes the ordering correct (before AGP reads the DSL to create variants) |
+| 14 | `build_and_release.yml` | the runner image ships NDK 27/28/29, but the app pins `23.1.7779620`, so the build depended on AGP's implicit SDK download and would have failed late in `:app:stripReleaseDebugSymbols` | install the pinned NDK with `sdkmanager` first, as a no-op when it is already there |
+| 15 | both workflows | `actions/deploy-pages` replaces the **entire** site, so the two pipelines deleted each other's files: a dashboard deploy 404'd `latest_version.json`, a release 404'd the dashboard | one shared builder (`.github/scripts/build_pages_site.sh`) that both workflows call; each now publishes the complete site, reconstructing the manifest from the GitHub Release when it is the server workflow's turn |
+| 16 | both workflows | the dashboard was built with `--base-href /update-admin/`, but a project Pages site is served from `/<repo>/`, so `index.html` loaded and **every asset 404'd**: `/update-admin/flutter_bootstrap.js` → 404 while `/Harbor/update-admin/flutter_bootstrap.js` → 200 | derive the absolute href from `actions/configure-pages`'s `base_path`, and stage the dashboard into only the last path segment so the artifact does not gain a second `/<repo>/` level |
+| 17 | `update_server/bin/server.dart` | the compiled server **never exited on SIGTERM**. The signal handlers ran and reported `state flushed`, but the `ProcessSignal` subscriptions keep the Dart event loop alive after `main()` returns, so the smoke test's `wait` blocked — the job sat *in progress* for 20+ minutes. Reproduced locally: the same probe returns from `wait` in 0.25 s with the fix and never returns without it | call `exit(0)` once the shutdown work has finished and stdout is flushed, and make the shutdown itself bounded (stop the listener → drain in-flight requests through the new `InFlightTracker` → force-close), so no step can stall the exit |
+| 18 | `deploy_update_server.yml` | the smoke test's teardown used an unbounded `wait`, which is what turned #17 into a hung runner | poll for up to 10 s, comparing `/proc` state (because `kill -0` also succeeds for a zombie), then escalate to `SIGKILL`; every job in both workflows also gets a `timeout-minutes` ceiling |
 
-A first-run failure in the widget tests or the APK build blocks the release rather than shipping
-it, which is the intended behaviour.
+### Limits of this verification
+
+- The client's 260 tests and the APK build execute **only on GitHub's x86-64 runners**. The
+  environment this repository was assembled in has an aarch64 host and an x86-64-only Flutter
+  engine, so `flutter test` and `flutter build apk` cannot run locally; the local mirrors are
+  used for analysis and for executing the Flutter-free code.
+- The `flutter_test`-based widget tests are executed on CI (they need `dart:ui`). Locally they
+  are compile-verified against the real `flutter_test` package, not run.
+- The admin dashboard is built and served, and its assets were fetched over HTTP, but no browser
+  has rendered it here; nothing verifies its visual layout or its WebSocket-free polling loop.
+- The release build falls back to **debug signing** when `android/key.properties` is absent,
+  which is what CI produced. That APK installs, but it is not a Play-Store-ready artifact — see
+  §5.
+- The smoke test exercises `/health` and `/api/v1/update-check`; the admin mutations are covered
+  by the 34-test suite over real HTTP, not by the smoke test.
 
 ---
 
