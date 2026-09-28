@@ -17,10 +17,12 @@ permissions:
   pages: write
   id-token: write
 
-# Only one GitHub Pages deployment may run at a time; queued runs wait rather
-# than cancelling a deploy that is already publishing.
+# Only one GitHub Pages deployment may run at a time. This group name is shared
+# with build_and_release.yml on purpose: both workflows replace the same Pages
+# site, so serialising them repository-wide is what keeps their deploys from
+# racing. Queued runs wait rather than cancelling a deploy that is publishing.
 concurrency:
-  group: pages-update-server
+  group: pages
   cancel-in-progress: false
 
 env:
@@ -200,38 +202,96 @@ jobs:
 
           echo "Web build settings: base_href=${base_href} api_base_url=${api_base_url}"
 
-      - name: Build Flutter Web dashboard
+      # actions/deploy-pages replaces the whole site with the uploaded artifact.
+      # This workflow owns the dashboard, build_and_release.yml owns the update
+      # manifest, so this step reconstructs the manifest from the published
+      # GitHub Release before assembling the site. Without it, deploying the
+      # dashboard would delete latest_version.json.
+      - name: Resolve release metadata for the manifest
+        id: release
         shell: bash
         env:
-          API_BASE_URL: ${{ steps.settings.outputs.api_base_url }}
-          BASE_HREF: ${{ steps.settings.outputs.base_href }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          flutter build web --release \
-            --base-href "${BASE_HREF}" \
-            --dart-define=HARBOR_API_BASE_URL="${API_BASE_URL}"
 
-      - name: Verify web build output
+          empty_result() {
+            {
+              echo "version="
+              echo "tag="
+              echo "sha256="
+              echo "size_bytes="
+              echo "published_at="
+              echo "changelog_file="
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::warning::gh CLI is unavailable; publishing the dashboard without latest_version.json."
+            empty_result
+            exit 0
+          fi
+
+          tag="$(gh release view --repo "$REPOSITORY" --json tagName --jq '.tagName' 2>/dev/null || true)"
+          if [ -z "$tag" ]; then
+            echo "::warning::No GitHub Release exists yet; publishing the dashboard without latest_version.json."
+            empty_result
+            exit 0
+          fi
+
+          work_dir="$(mktemp -d)"
+          if ! gh release download "$tag" --repo "$REPOSITORY" --pattern SHA256SUMS --dir "$work_dir" 2>/dev/null; then
+            echo "::warning::Release ${tag} has no SHA256SUMS asset; publishing the dashboard without latest_version.json."
+            empty_result
+            exit 0
+          fi
+
+          sha256="$(awk '$2 == "app-release.apk" { print $1 }' "${work_dir}/SHA256SUMS" | head -n1)"
+          size_bytes="$(gh release view "$tag" --repo "$REPOSITORY" --json assets \
+            --jq '.assets[] | select(.name == "app-release.apk") | .size' 2>/dev/null || true)"
+          published_at="$(gh release view "$tag" --repo "$REPOSITORY" --json publishedAt \
+            --jq '.publishedAt' 2>/dev/null || true)"
+
+          if [ -z "$sha256" ] || [ -z "$size_bytes" ]; then
+            echo "::warning::Release ${tag} does not carry a usable app-release.apk; publishing the dashboard without latest_version.json."
+            empty_result
+            exit 0
+          fi
+
+          gh release view "$tag" --repo "$REPOSITORY" --json body --jq '.body' > "${work_dir}/CHANGELOG.md"
+          if [ ! -s "${work_dir}/CHANGELOG.md" ]; then
+            printf 'Release %s\n' "$tag" > "${work_dir}/CHANGELOG.md"
+          fi
+
+          version="${tag#v}"
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "sha256=${sha256}"
+            echo "size_bytes=${size_bytes}"
+            echo "published_at=${published_at}"
+            echo "changelog_file=${work_dir}/CHANGELOG.md"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Manifest inputs resolved from release ${tag} (version ${version}, ${size_bytes} bytes)."
+
+      - name: Assemble the complete Pages site
         shell: bash
         env:
-          BASE_HREF: ${{ steps.settings.outputs.base_href }}
-        run: |
-          set -euo pipefail
-          build_dir="build/web"
-          if [ ! -d "$build_dir" ]; then
-            echo "::error::Expected Flutter Web output at apps/update_server/${build_dir}."
-            exit 1
-          fi
-          for required in index.html flutter_bootstrap.js main.dart.js; do
-            if [ ! -s "${build_dir}/${required}" ]; then
-              echo "::error::Web build member ${build_dir}/${required} is missing or empty."
-              exit 1
-            fi
-          done
-          if ! grep -q "${BASE_HREF}" "${build_dir}/index.html"; then
-            echo "::warning::Built index.html does not contain the configured base href ${BASE_HREF}."
-          fi
-          echo "Web build verified at ${build_dir} ($(du -sh "$build_dir" | cut -f1))."
+          SITE_DIR: ${{ github.workspace }}/site
+          REPO: ${{ github.repository }}
+          API_BASE_URL: ${{ steps.settings.outputs.api_base_url }}
+          ADMIN_BASE_HREF: ${{ steps.settings.outputs.base_href }}
+          MIN_SUPPORTED_VERSION: ${{ vars.HARBOR_MIN_SUPPORTED_VERSION }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SHA256: ${{ steps.release.outputs.sha256 }}
+          SIZE_BYTES: ${{ steps.release.outputs.size_bytes }}
+          PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
+          CHANGELOG_FILE: ${{ steps.release.outputs.changelog_file }}
+        run: bash "${{ github.workspace }}/.github/scripts/build_pages_site.sh"
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -239,7 +299,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: apps/update_server/build/web
+          path: site
 
       - name: Deploy admin dashboard to GitHub Pages
         id: deployment
@@ -251,6 +311,7 @@ jobs:
         env:
           BASE_HREF: ${{ steps.settings.outputs.base_href }}
           API_BASE_URL: ${{ steps.settings.outputs.api_base_url }}
+          VERSION: ${{ steps.release.outputs.version }}
           PAGE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
           {
@@ -260,6 +321,7 @@ jobs:
             echo "| --- | --- |"
             echo "| Dashboard base href | \`${BASE_HREF}\` |"
             echo "| API base URL | \`${API_BASE_URL}\` |"
+            echo "| Manifest version | \`${VERSION:-not republished}\` |"
             echo "| Pages URL | ${PAGE_URL:-not deployed} |"
             echo "| Commit | \`${GITHUB_SHA}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

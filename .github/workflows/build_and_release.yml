@@ -38,6 +38,10 @@ env:
   FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
   # Name of the single artifact bundle shared by the release and pages jobs.
   RELEASE_ARTIFACT_NAME: 'harbor-release-assets'
+  # Subdirectory the admin dashboard is served from. It must start and end with
+  # a slash, and it is kept identical to deploy_update_server.yml so both
+  # workflows assemble exactly the same site layout.
+  ADMIN_BASE_HREF: '/update-admin/'
 
 jobs:
   build-apk:
@@ -461,131 +465,65 @@ jobs:
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Build Pages site and latest_version.json
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Resolve dashboard API base URL
+        id: api
         shell: bash
         env:
+          API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
+          FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
+        run: |
+          set -euo pipefail
+          api_base_url="${API_BASE_URL:-}"
+          if [ -z "$api_base_url" ]; then
+            api_base_url="${FALLBACK}"
+            echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
+          fi
+          echo "api_base_url=${api_base_url}" >> "$GITHUB_OUTPUT"
+          echo "Dashboard will call ${api_base_url}."
+
+      # actions/deploy-pages replaces the whole site, so this job publishes the
+      # complete site — the dashboard that deploy_update_server.yml owns plus
+      # the manifest this workflow owns — rather than only its own half.
+      - name: Assemble the complete Pages site
+        shell: bash
+        env:
+          SITE_DIR: ${{ github.workspace }}/site
+          REPO: ${{ github.repository }}
+          API_BASE_URL: ${{ steps.api.outputs.api_base_url }}
+          ADMIN_BASE_HREF: ${{ env.ADMIN_BASE_HREF }}
+          MIN_SUPPORTED_VERSION: ${{ vars.HARBOR_MIN_SUPPORTED_VERSION }}
           VERSION: ${{ needs.build-apk.outputs.version }}
           TAG: ${{ needs.build-apk.outputs.tag }}
           SHA256: ${{ needs.build-apk.outputs.sha256 }}
           SIZE_BYTES: ${{ needs.build-apk.outputs.size_bytes }}
-          MIN_SUPPORTED_VERSION: ${{ vars.HARBOR_MIN_SUPPORTED_VERSION }}
-          REPOSITORY: ${{ github.repository }}
           CHANGELOG_FILE: ${{ github.workspace }}/release-assets/CHANGELOG.md
-          SITE_DIR: ${{ github.workspace }}/site
+        run: bash .github/scripts/build_pages_site.sh
+
+      - name: Pages summary
+        shell: bash
+        env:
+          VERSION: ${{ needs.build-apk.outputs.version }}
+          TAG: ${{ needs.build-apk.outputs.tag }}
+          SIZE_BYTES: ${{ needs.build-apk.outputs.size_bytes }}
+          ADMIN_BASE_HREF: ${{ env.ADMIN_BASE_HREF }}
         run: |
           set -euo pipefail
-
-          site="${SITE_DIR}"
-          rm -rf "$site"
-          mkdir -p "$site"
-
-          if ! printf '%s' "$SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
-            echo "::error::Refusing to publish: sha256 '${SHA256}' is not 64 lowercase hex characters."
-            exit 1
-          fi
-          if ! printf '%s' "$SIZE_BYTES" | grep -Eq '^[0-9]+$'; then
-            echo "::error::Refusing to publish: size_bytes '${SIZE_BYTES}' is not an integer."
-            exit 1
-          fi
-          if [ ! -s "$CHANGELOG_FILE" ]; then
-            echo "::error::Changelog file ${CHANGELOG_FILE} is missing or empty."
-            exit 1
-          fi
-
-          min_supported="${MIN_SUPPORTED_VERSION:-}"
-          if [ -z "$min_supported" ]; then
-            min_supported="$VERSION"
-          fi
-          export HARBOR_MIN_SUPPORTED_RESOLVED="$min_supported"
-
-          python3 - <<'PY'
-          import datetime
-          import json
-          import os
-
-          repository = os.environ["REPOSITORY"]
-          tag = os.environ["TAG"]
-          with open(os.environ["CHANGELOG_FILE"], encoding="utf-8") as handle:
-              changelog = handle.read().strip()
-
-          published_at = (
-              datetime.datetime.now(datetime.timezone.utc)
-              .replace(microsecond=0)
-              .isoformat()
-              .replace("+00:00", ".000Z")
-          )
-
-          payload = {
-              "latest_version": os.environ["VERSION"],
-              "min_supported_version": os.environ["HARBOR_MIN_SUPPORTED_RESOLVED"],
-              "download_url": f"https://github.com/{repository}/releases/download/{tag}/app-release.apk",
-              "sha256": os.environ["SHA256"],
-              "size_bytes": int(os.environ["SIZE_BYTES"]),
-              "changelog": changelog,
-              "force_update": False,
-              "published_at": published_at,
-              "platform": "android",
-              "update_available": True,
-              "update_required": False,
-              "release_notes_url": f"https://github.com/{repository}/releases/tag/{tag}",
-          }
-
-          destination = os.path.join(os.environ["SITE_DIR"], "latest_version.json")
-          with open(destination, "w", encoding="utf-8") as handle:
-              json.dump(payload, handle, indent=2, ensure_ascii=False)
-              handle.write("\n")
-          print(f"Wrote {destination}")
-          PY
-
-          if command -v jq >/dev/null 2>&1; then
-            jq empty "$site/latest_version.json"
-          else
-            echo "::warning::jq not found on the runner; validated with python3 json instead."
-          fi
-          python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8")); print("JSON OK", sys.argv[1])' "$site/latest_version.json"
-
-          cp release-assets/SHA256SUMS "$site/SHA256SUMS"
-
-          cat > "$site/index.html" <<'HTML'
-          <!doctype html>
-          <html lang="en">
-            <head>
-              <meta charset="utf-8" />
-              <meta name="viewport" content="width=device-width, initial-scale=1" />
-              <title>Harbor OTA update manifest</title>
-              <style>
-                body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 42rem; line-height: 1.6; padding: 0 1rem; }
-                code { background: #f2f2f2; padding: 0.1rem 0.3rem; border-radius: 4px; }
-              </style>
-            </head>
-            <body>
-              <h1>Harbor OTA update manifest</h1>
-              <p>
-                This GitHub Pages site publishes the frozen release manifest consumed by
-                <code>apps/update_server</code> and <code>apps/main_app</code>.
-              </p>
-              <ul>
-                <li><a href="./latest_version.json">latest_version.json</a> - the update-check contract</li>
-                <li><a href="./SHA256SUMS">SHA256SUMS</a> - checksums for the published release assets</li>
-              </ul>
-            </body>
-          </html>
-          HTML
-
-          if [ ! -s "$site/index.html" ] || [ ! -s "$site/latest_version.json" ]; then
-            echo "::error::Pages site is incomplete."
-            exit 1
-          fi
-
           {
-            echo "### Pages manifest published"
+            echo "### Pages site published"
             echo ""
             echo "| Field | Value |"
             echo "| --- | --- |"
             echo "| latest_version | \`${VERSION}\` |"
-            echo "| min_supported_version | \`${min_supported}\` |"
             echo "| tag | \`${TAG}\` |"
             echo "| size_bytes | ${SIZE_BYTES} |"
+            echo "| dashboard | \`${ADMIN_BASE_HREF}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Pages artifact
