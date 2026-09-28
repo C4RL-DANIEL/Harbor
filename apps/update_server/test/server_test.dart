@@ -832,6 +832,24 @@ void main() {
       }
     });
 
+    test('agrees with the server seed written when no state exists', () {
+      // The seed a hosted server serves, the static Pages document and the
+      // client's compiled-in default must all describe the same first-run UI,
+      // or the app's screen changes depending on whether a server is up.
+      final FeatureFlagMatrix seeded = ServerState.seed().flags;
+      final FeatureFlagMatrix published =
+          FeatureFlagMatrix.fromJson(document);
+
+      expect(seeded.version, published.version);
+      expect(seeded.flags, published.flags);
+      expect(seeded.remoteDefaults, published.remoteDefaults);
+      expect(
+        jsonEncode(seeded.layout),
+        jsonEncode(published.layout),
+        reason: 'ServerState.seed() layout drifted from default_flags.json',
+      );
+    });
+
     test('every module flag is declared in the matrix', () {
       final FeatureFlagMatrix matrix = FeatureFlagMatrix.fromJson(document);
       final Set<String> declared = <String>{

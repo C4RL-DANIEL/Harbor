@@ -678,9 +678,13 @@ class ServerState {
 
   /// The defaults written when no state file exists yet.
   ///
-  /// The exact layout shape below (a `thinking_panel` module gated on the
-  /// `agent.thinking` flag) is consumed by the main app's dynamic module
-  /// registry; do not change it without updating the client.
+  /// The layout below must stay in step with two other copies of the same
+  /// document: the client's compiled-in `kDefaultFlagMatrix` (apps/main_app) and
+  /// `apps/update_server/flags/default_flags.json`, which the Pages builder
+  /// publishes as `/api/v1/flags.json`. All three describe the same first-run UI,
+  /// so a hosted server, a static Pages deployment and a fully offline app
+  /// render the same thing. Every `type` here must have a renderer in the
+  /// client's `DynamicModuleRegistry`; both test suites assert that.
   static ServerState seed({DateTime? now}) {
     final DateTime publishedAt =
         DateTime.utc(2026, 2, 1, 10, 0, 0);
@@ -728,11 +732,58 @@ class ServerState {
               'order': 0,
               'modules': <Object?>[
                 <String, Object?>{
+                  'id': 'engine_status',
+                  'type': 'engine_status',
+                  'flag': '',
+                  'order': 0,
+                },
+                <String, Object?>{
                   'id': 'thinking_panel',
                   'type': 'thinking_panel',
                   'flag': 'agent.thinking',
-                  'order': 0,
+                  'order': 1,
                   'props': <String, Object?>{'collapsedByDefault': true},
+                },
+                <String, Object?>{
+                  'id': 'agent_console',
+                  'type': 'agent_console',
+                  'flag': 'agent.subagents',
+                  'order': 2,
+                },
+                <String, Object?>{
+                  'id': 'file_inspector',
+                  'type': 'file_inspector',
+                  'flag': '',
+                  'order': 3,
+                },
+                <String, Object?>{
+                  'id': 'update_status',
+                  'type': 'update_status',
+                  'flag': '',
+                  'order': 4,
+                },
+                <String, Object?>{
+                  'id': 'feature_flags',
+                  'type': 'feature_flags',
+                  'flag': 'dynamic_ui',
+                  'order': 5,
+                },
+              ],
+            },
+            <String, Object?>{
+              'id': 'labs',
+              'title': 'Labs',
+              'order': 1,
+              'modules': <Object?>[
+                <String, Object?>{
+                  'id': 'labs_announcement',
+                  'type': 'banner',
+                  'flag': 'labs.voice_mode',
+                  'order': 0,
+                  'props': <String, Object?>{
+                    'message': 'Voice mode is enabled for this account.',
+                    'severity': 'info',
+                  },
                 },
               ],
             },

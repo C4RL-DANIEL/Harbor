@@ -196,12 +196,19 @@ The release workflow defaults `HARBOR_API_BASE_URL` to the project's GitHub Page
 with no configuration at all still checks for updates and syncs flags. Only a 404 triggers the
 fallback — a 5xx is reported as a real server error rather than silently masked.
 
-The client also ships a compiled-in `kDefaultFlagMatrix` (see `main.dart`) so the first frame
-already renders the correct layout with no network at all. Its module `type`s must exist in
-`DynamicModuleRegistry.defaultBuilders`; `dynamic_module_registry_test.dart` asserts that,
-because a mistyped type renders a placeholder card instead of a working module.
-`apps/update_server/flags/default_flags.json` is the same document, published to Pages as
-`/api/v1/flags.json`, and the server suite validates that copy.
+The first-run UI is described in **three** places, and they must agree — otherwise the app's
+screen would change depending on whether a server happened to be up:
+
+| Copy | Consumed by |
+| --- | --- |
+| `kDefaultFlagMatrix` in `apps/main_app/lib/main.dart` | the app, before any sync |
+| `apps/update_server/flags/default_flags.json` | the Pages site, as `/api/v1/flags.json` |
+| `ServerState.seed()` in `apps/update_server/lib/src/models.dart` | a freshly deployed server with no state file |
+
+Every module `type` must exist in `DynamicModuleRegistry.defaultBuilders`: an unregistered type
+does not vanish, it renders the "unsupported module" placeholder, so a typo yields a screen of
+dead cards. Both suites guard this — `dynamic_module_registry_test.dart` checks the client copy
+against the registry, and the server suite checks the published copy against the seed.
 
 ---
 
