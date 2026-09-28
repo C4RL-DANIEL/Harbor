@@ -146,7 +146,7 @@ void main() {
     });
 
     test('breaks module order ties by id', () {
-      final DynamicSection section = DynamicSection.fromJson(<String, Object?>{
+      final DynamicSection section = DynamicSection.fromJson(const <String, Object?>{
         'id': 's',
         'modules': <Object?>[
           <String, Object?>{'id': 'b', 'type': 't', 'order': 1},
@@ -193,20 +193,20 @@ void main() {
   group('DynamicModule', () {
     test('missing id throws FlagParseException', () {
       expect(
-        () => DynamicModule.fromJson(<String, Object?>{'type': 't'}),
+        () => DynamicModule.fromJson(const <String, Object?>{'type': 't'}),
         throwsA(isA<FlagParseException>()),
       );
     });
 
     test('missing type throws FlagParseException', () {
       expect(
-        () => DynamicModule.fromJson(<String, Object?>{'id': 'm'}),
+        () => DynamicModule.fromJson(const <String, Object?>{'id': 'm'}),
         throwsA(isA<FlagParseException>()),
       );
     });
 
     test('prop<T> reads typed values and coerces', () {
-      final DynamicModule module = DynamicModule(
+      const DynamicModule module = DynamicModule(
         id: 'm',
         type: 't',
         flag: '',
@@ -241,7 +241,7 @@ void main() {
     });
 
     test('toJson round-trips every field', () {
-      final DynamicModule module = DynamicModule(
+      const DynamicModule module = DynamicModule(
         id: 'm',
         type: 'banner',
         flag: 'x',
@@ -281,14 +281,14 @@ void main() {
   group('DynamicSection', () {
     test('missing id throws FlagParseException', () {
       expect(
-        () => DynamicSection.fromJson(<String, Object?>{}),
+        () => DynamicSection.fromJson(const <String, Object?>{}),
         throwsA(isA<FlagParseException>()),
       );
     });
 
     test('a non-object module entry throws FlagParseException', () {
       expect(
-        () => DynamicSection.fromJson(<String, Object?>{
+        () => DynamicSection.fromJson(const <String, Object?>{
           'id': 's',
           'modules': <Object?>[42],
         }),
@@ -298,7 +298,7 @@ void main() {
 
     test('title defaults to the id and flag defaults to empty', () {
       final DynamicSection section = DynamicSection.fromJson(
-          <String, Object?>{'id': 's', 'modules': <Object?>[]});
+          const <String, Object?>{'id': 's', 'modules': <Object?>[]});
       expect(section.title, 's');
       expect(section.flag, '');
       expect(section.order, 0);
@@ -572,7 +572,7 @@ void main() {
       final FeatureFlagMatrix cached = FeatureFlagMatrix(
         version: 9,
         updatedAt: DateTime.utc(2026, 1, 1),
-        flags: <String, Object?>{'flag.x': false},
+        flags: const <String, Object?>{'flag.x': false},
         remoteDefaults: const <String, Object?>{},
         layout: DynamicLayout.empty,
       );
@@ -621,11 +621,11 @@ void main() {
 
     test('initialize is idempotent', () async {
       SharedPreferences.setMockInitialValues(<String, Object>{
-        _cacheKey: jsonEncode(FeatureFlagMatrix(
+        _cacheKey: jsonEncode(const FeatureFlagMatrix(
           version: 4,
           updatedAt: null,
-          flags: const <String, Object?>{'a': true},
-          remoteDefaults: const <String, Object?>{},
+          flags: <String, Object?>{'a': true},
+          remoteDefaults: <String, Object?>{},
           layout: DynamicLayout.empty,
         ).toJson()),
       });
@@ -644,11 +644,11 @@ void main() {
     });
 
     test('a seed is used when there is no cache', () async {
-      final FeatureFlagMatrix seed = FeatureFlagMatrix(
+      const FeatureFlagMatrix seed = FeatureFlagMatrix(
         version: 0,
         updatedAt: null,
-        flags: const <String, Object?>{'seeded': true},
-        remoteDefaults: const <String, Object?>{},
+        flags: <String, Object?>{'seeded': true},
+        remoteDefaults: <String, Object?>{},
         layout: DynamicLayout.empty,
       );
       final FeatureFlagProvider provider =
@@ -676,7 +676,7 @@ void main() {
       final FeatureFlagMatrix matrix = FeatureFlagMatrix(
         version: 1,
         updatedAt: null,
-        flags: <String, Object?>{'on': true, 'off': false, 'sec.off': false},
+        flags: const <String, Object?>{'on': true, 'off': false, 'sec.off': false},
         remoteDefaults: const <String, Object?>{},
         layout: DynamicLayout(
           sections: <DynamicSection>[

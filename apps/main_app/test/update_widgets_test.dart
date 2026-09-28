@@ -34,12 +34,14 @@ typedef _PerformUpdate = Future<Stream<InstallProgress>> Function(
 class _FakeUpdateService extends UpdateService {
   _FakeUpdateService({
     _PerformUpdate? onPerform,
-    InstallStrategy strategy = InstallStrategy.nativeStreaming,
+    // Kept as a super parameter rather than dropped: the fake must stay able
+    // to inject a non-default strategy. The default is inherited from
+    // UpdateService (InstallStrategy.nativeStreaming).
+    super.strategy,
   })  : _onPerform = onPerform,
         super(
           baseUrl: 'https://updates.test',
           currentVersion: '1.0.0',
-          strategy: strategy,
           client: MockClient(
               (http.Request request) async => http.Response('{}', 500)),
         );
@@ -65,12 +67,11 @@ class _FakeUpdateService extends UpdateService {
 /// service stream).
 class _StubFlowController extends UpdateFlowController {
   _StubFlowController({
-    required UpdateService service,
+    required super.service,
     required UpdateFlowStage stage,
     DownloadProgress? progress,
   })  : stubStage = stage,
-        stubProgress = progress,
-        super(service: service);
+        stubProgress = progress;
 
   final UpdateFlowStage stubStage;
   final DownloadProgress? stubProgress;
@@ -227,6 +228,43 @@ void main() {
       expect(find.text('disk full'), findsOneWidget);
       expect(find.text('Retry update'), findsOneWidget);
       expect(find.byIcon(Icons.refresh), findsOneWidget);
+    });
+
+    testWidgets('verifyThenInstall routes the flow through the verifying stage',
+        (WidgetTester tester) async {
+      final _FakeUpdateService service = _FakeUpdateService(
+        strategy: InstallStrategy.verifyThenInstall,
+        onPerform: (ReleaseInfo release,
+                void Function(DownloadProgress progress)? onProgress) =>
+            Future<Stream<InstallProgress>>.value(
+                const Stream<InstallProgress>.empty()),
+      );
+      addTearDown(service.dispose);
+      final UpdateFlowController controller =
+          UpdateFlowController(service: service);
+      addTearDown(controller.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: ForceUpdateDialog(
+            release: _release(),
+            installedVersion: '1.0.0',
+            controller: controller,
+          ),
+        ),
+      ));
+
+      // The empty stream ends immediately, so no install is ever reported and
+      // start() returns false. The point of the test is the stage the
+      // controller sits in: UpdateFlowController.start branches on
+      // service.strategy, and verifyThenInstall is the only strategy that
+      // routes the flow through `verifying` instead of jumping straight from
+      // downloading to the terminal idle end state.
+      final bool started = await controller.start(_release());
+      await tester.pump();
+
+      expect(started, isFalse);
+      expect(controller.stage, UpdateFlowStage.verifying);
     });
   });
 
@@ -408,7 +446,7 @@ void main() {
       final FeatureFlagProvider flags = _flagProvider();
       final DynamicModuleRegistry registry = DynamicModuleRegistry();
       final DynamicModuleContext context = _context(flags);
-      final DynamicModule module =
+      const DynamicModule module =
           DynamicModule(id: 'mystery1', type: 'mystery', flag: '');
 
       await tester.pumpWidget(MaterialApp(
@@ -433,7 +471,7 @@ void main() {
               const Text('CUSTOM ENGINE'));
       expect(registry.supports('engine_status'), isTrue);
 
-      final DynamicModule module =
+      const DynamicModule module =
           DynamicModule(id: 'engine1', type: 'engine_status', flag: '');
 
       await tester.pumpWidget(MaterialApp(
@@ -450,11 +488,11 @@ void main() {
 
     testWidgets('buildLayout with everything hidden shows the empty notice',
         (WidgetTester tester) async {
-      final FeatureFlagMatrix matrix = FeatureFlagMatrix(
+      const FeatureFlagMatrix matrix = FeatureFlagMatrix(
         version: 1,
         updatedAt: null,
-        flags: const <String, Object?>{'off': false},
-        remoteDefaults: const <String, Object?>{},
+        flags: <String, Object?>{'off': false},
+        remoteDefaults: <String, Object?>{},
         layout: DynamicLayout(
           sections: <DynamicSection>[
             DynamicSection(

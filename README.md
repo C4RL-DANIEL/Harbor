@@ -242,25 +242,42 @@ directly from the release artifact.
 ### `build_and_release.yml` — triggered by a `v*.*.*` tag
 
 1. Java 17 (temurin) + Flutter **3.24.x** stable.
-2. `flutter build apk --release` with the version derived from the tag.
-3. Compute the APK's SHA256 and emit `SHA256SUMS`, `CHANGELOG.md`, `version.txt`, `tag.txt`.
-4. Create the GitHub Release and upload the APK plus checksums.
-5. Generate `latest_version.json` and deploy it to **GitHub Pages**.
+2. **Gate:** `flutter analyze --fatal-infos --fatal-warnings`, then `flutter test`. Both run
+   *before* the APK is built, so a broken build cannot be published as a release.
+3. `flutter build apk --release` with the version derived from the tag.
+4. Compute the APK's SHA256 and emit `SHA256SUMS`, `CHANGELOG.md`, `version.txt`, `tag.txt`.
+5. Create the GitHub Release and upload the APK plus checksums.
+6. Generate `latest_version.json` and deploy it to **GitHub Pages**.
 
 The `update-check` response points at that release, so the whole loop is: tag → APK → metadata
 → every installed client sees the update on next launch.
+
+The workflow also has a `workflow_dispatch` trigger taking `version` and a boolean `dry_run`.
+`dry_run: true` runs steps 1–4 only and skips the Release and the Pages deploy, which is how
+the APK build and the widget tests get verified on CI *without* cutting a tag. This matters
+because `flutter analyze` treats info-level lints as fatal by default
+(`flutter_tools/lib/src/commands/analyze.dart` defaults `--fatal-infos` to `true`), so the
+analysis gate is stricter than it may look.
 
 Release-shape inputs come from repository **variables** (not secrets):
 `HARBOR_API_BASE_URL`, `HARBOR_MIN_SUPPORTED_VERSION`, `HARBOR_PUBLISH_IMAGE`. Only
 `secrets.GITHUB_TOKEN` is used.
 
-> Pages must be configured with **Source = GitHub Actions** for the Pages deploy step to work.
+> Pages is enabled on this repository with `build_type: workflow`, which is the setting the
+> `configure-pages` / `deploy-pages` actions require. If it is ever turned off, those steps fail
+> with `Get Pages site failed`.
 
 ### `deploy_update_server.yml`
 
-Verifies the server on the Dart VM, builds the Flutter Web admin dashboard to Pages
-(`base-href /update-admin/`), and optionally publishes a server container image (gated on
+Verifies the server, builds the Flutter Web admin dashboard to Pages
+(`base-href /update-admin/`), and optionally publishes a server binary artifact (gated on
 `workflow_dispatch` or `vars.HARBOR_PUBLISH_IMAGE == 'true'`).
+
+The verify job installs Flutter and resolves with `flutter pub get`, then runs
+`dart analyze --fatal-infos --fatal-warnings` and `dart test` using the Dart CLI from that same
+Flutter SDK. Using one SDK for both keeps the analyzer version identical to the one that builds
+the web app, and running the server suite on the plain Dart VM via `dart test` (rather than
+`flutter test`) is what demonstrates the headless claim.
 
 ---
 
@@ -278,10 +295,10 @@ A FileProvider root that does not cover that directory makes `getUriForFile` thr
 starts. `res/xml/provider_paths.xml` therefore declares:
 
 ```xml
-<paths>
-    <files-path name="ota_update" path="ota_update/" />
-    <cache-path name="ota_cache" path="." />
-    <external-files-path name="ota_external" path="." />
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-files-path name="external_files" path="." />
+    <cache-path name="cache" path="." />
+    <files-path name="files" path="." />
 </paths>
 ```
 
@@ -310,11 +327,35 @@ flutter run --dart-define=HARBOR_API_BASE_URL=http://10.0.2.2:8080
 
 ### Server
 
+`apps/update_server` declares `flutter: sdk: flutter`, because `lib/main.dart` is the Flutter
+Web admin dashboard. That single dependency means **`dart pub get` cannot resolve the package
+at all**:
+
+```
+Because update_server requires the Flutter SDK, version solving failed.
+Flutter users should use `flutter pub` instead of `dart pub`.
+```
+
+So dependencies are always resolved with the Flutter tool, and the Dart CLI bundled with that
+same Flutter SDK is then used for everything else:
+
 ```bash
 cd apps/update_server
-dart pub get
+flutter pub get
 HARBOR_ADMIN_TOKEN=dev-token dart run bin/server.dart
+
+# The suite covers only Flutter-free code and runs on the plain Dart VM.
+dart test
+dart analyze --fatal-infos --fatal-warnings
+
+# The dashboard, and a headless binary of the server.
+flutter build web --release --base-href /update-admin/
+dart compile exe bin/server.dart -o build/harbor-update-server
 ```
+
+Everything under `bin/` and `lib/src/` is Flutter-free by design, which is what keeps
+`dart compile exe` and `dart test` working; `deploy_update_server.yml` asserts that invariant
+with a `grep` gate so it cannot rot.
 
 The admin dashboard is served from `build/web` when it exists, and otherwise the server
 answers with a JSON landing page (so a bare server is still self-describing). Shutdown is
@@ -345,10 +386,12 @@ sources**, however, were available and were used directly — see below.
   - **30** covering the update server, driven through real HTTP over loopback: the zero
     payload, update-decision math (including pre-release ordering), validation, admin auth
     (401/503), flag merging, and `latest_version.json`.
-- The **whole client `lib/` analyzes clean** with `dart analyze --fatal-infos --fatal-warnings`
-  under the repository's real `analysis_options.yaml`, resolving `package:flutter/material.dart`
-  against the **real Flutter 3.24.5 framework sources** plus `sky_engine`. That analysis is what
-  caught the five compile errors listed below.
+- The **whole client tree — `lib/` *and* `test/`** — analyzes clean with
+  `dart analyze --fatal-infos --fatal-warnings` under the repository's real
+  `analysis_options.yaml`, resolving `package:flutter/material.dart` against the **real Flutter
+  3.24.5 framework sources** plus `sky_engine`, and `package:flutter_test` against the **real
+  `flutter_test` package** (including its `leak_tracker_flutter_testing` dependent). The widget
+  tests are therefore compile-verified, not merely syntax-checked.
 - The **update server layer** analyzes clean under its own stricter config, which adds
   `strict-raw-types` and `avoid_dynamic_calls`.
 - Both workflow YAML files parse cleanly and all `run:` scripts pass `bash -n`.
@@ -358,10 +401,25 @@ sources**, however, were available and were used directly — see below.
 - `update_service.dart` and `dynamic_feature_flag_provider.dart` were **executed** against a
   minimal stand-in for the two Flutter types they use (`@immutable`, `ChangeNotifier`).
 
+### Proven on GitHub Actions
+
+The first runs were not a formality — they failed, and fixing them is what the second table
+below records. Current state:
+
+| Workflow / job | Result |
+| --- | --- |
+| `deploy_update_server.yml` → *Analyze and test update server* | **passes** — `flutter pub get`, the Flutter-free gate, `dart analyze --fatal-infos --fatal-warnings`, and `dart test` (30 tests) |
+| `deploy_update_server.yml` → *Build and deploy admin dashboard* | `flutter build web --release` **passes**; the Pages publish step failed only because Pages was not enabled on the repository |
+| `build_and_release.yml` → *Build release APK* | reaches `flutter pub get` successfully; the analysis gate then failed on 35 info-level lints, now fixed |
+| `build_and_release.yml` → *Release* / *Pages* | correctly **skipped** under `dry_run` |
+
+GitHub Pages is now enabled on the repository with `build_type: workflow`, so neither deploy
+depends on a manual settings change any more.
+
 ### Bugs this process found and fixed
 
-Analysis against the real framework caught five genuine compile errors that would have failed
-`flutter build apk` on the first tag:
+Static analysis against the real Flutter 3.24.5 framework caught five compile errors before the
+first push that would have failed `flutter build apk` on the first tag:
 
 | File | Error | Fix |
 | --- | --- | --- |
@@ -371,18 +429,44 @@ Analysis against the real framework caught five genuine compile errors that woul
 | `update_dialog.dart` | unused `ota_update` import (an error under this config) | remove it |
 | `file_readers.dart` | archive 3.x `ArchiveFile` has no `compressedSize`; `GZipDecoder()` is not const; `loadYaml` was never imported | report `crc32` instead; drop `const`; add the import |
 
-### Not verifiable here — the first CI run is authoritative
+The first real CI runs then exposed a second class of failure — a mismatch between what was
+*assumed* about the toolchain and what it actually does:
 
-- `flutter pub get`, `flutter build apk` and `flutter build web` need the Flutter engine and run
-  on the x64 GitHub Actions runners.
-- **Widget tests** (`test/update_widgets_test.dart`, which pumps real widgets) have been
-  syntax-checked and API cross-checked but never executed. Likewise the server's Flutter Web
-  admin dashboard (`apps/update_server/lib/main.dart`) is analysis-verified, not run.
-- Because of that, `build_and_release.yml` now gates the release on `flutter analyze
-  --fatal-warnings` and `flutter test` **before** building the APK, and
-  `deploy_update_server.yml` runs `dart analyze --fatal-infos --fatal-warnings` and `dart test`.
-  A first-run failure in the widget tests means the release is blocked rather than shipped —
-  which is the intended behaviour.
+| # | Where | Problem | Fix |
+| --- | --- | --- | --- |
+| 1 | `deploy_update_server.yml` | both server jobs used `dart-lang/setup-dart`, but the package declares `flutter: sdk: flutter` (for `lib/main.dart`), so `dart pub get` **can never resolve it** — the run died at *Resolve Dart dependencies* | install Flutter 3.24.5 and resolve with `flutter pub get`, then use that SDK's bundled Dart CLI |
+| 2 | `update_server/lib/main.dart` | `Version` used without importing `pub_semver` — an outright compile error that broke `flutter build web` | add the import |
+| 3 | `update_server/lib/main.dart` | `dart:html` is deprecated and trips `avoid_web_libraries_in_flutter` under `--fatal-infos` | migrate the two `localStorage` call sites to `package:web` |
+| 4 | `update_server/test/server_test.dart` | imported `flutter_test` for tests that only exercise Flutter-free code, which makes `dart test` impossible and drags `dart:ui` into a server suite | import `package:test`; drop the unused `flutter_test` dev-dependency |
+| 5 | `android/app/build.gradle` | the NDK fallback literal (`26.1.10909125`) contradicted both its own comment and `FlutterExtension`, which pins `23.1.7779620` | align the fallback with the real pin |
+| 6 | `test/*.dart` | 35 info-level lints. `flutter analyze` defaults `--fatal-infos` to **true**, so these blocked the release gate | applied the `dart fix` `const`/super-parameter fixes and made the flags explicit in the workflow |
+| 7 | `test/update_widgets_test.dart` | the fake's `strategy` parameter was never supplied (`unused_element`). The obvious fix is to delete it — but `UpdateFlowController.start` branches on that strategy, so deleting it would have removed the only way to reach the `verifying` stage | keep it as `super.strategy` and add a test that exercises the branch |
+| 8 | `README.md` | the `provider_paths.xml` snippet did not match the file, and the server instructions said `dart pub get` — the exact command that fails | correct both |
+
+A note on #1, because it is the instructive one: local validation had passed against a mirror in
+which the `flutter` dependency was *stripped* so that `dart pub get` would work. The mirror
+therefore verified a package that was not the one being shipped. The fix was to make the mirror
+faithful — the real Flutter framework as a `path` dependency, with the SDK-sourced dependents
+(`flutter_test`, `leak_tracker_flutter_testing`) repointed the same way — and to re-run. It then
+reproduced CI's findings exactly, including the same 35 issues at the same line and column,
+which is what made them safe to fix locally.
+
+### Still not verified here — the next CI run is authoritative
+
+- `flutter test` (executing the 11 widget tests) and `flutter build apk --release` have not yet
+  run to completion. The analysis gate that previously blocked them now passes, so the next
+  dispatch or tag reaches them.
+- The widget tests are compile-verified and were audited for the usual runtime traps: they pump
+  `MaterialApp` wrappers rather than the real app, use hand-written fakes and a `MockClient`
+  (no plugins, no network, no `Platform`/`dart:io` branching), and their two `pumpAndSettle`
+  calls wrap a dialog route transition over static content, so they should settle.
+- The APK build is the remaining unknown: R8 with `shrinkResources` under
+  `android/app/proguard-rules.pro`, and whether the runner provides NDK `23.1.7779620`.
+- `apps/update_server/lib/main.dart` compiles (`flutter build web` passed on CI) but has never
+  been *run*.
+
+A first-run failure in the widget tests or the APK build blocks the release rather than shipping
+it, which is the intended behaviour.
 
 ---
 

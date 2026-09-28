@@ -160,7 +160,7 @@ void main() {
     });
 
     test('the zero payload reports hasRelease false', () {
-      final ReleaseInfo release = ReleaseInfo.fromJson(<String, Object?>{
+      final ReleaseInfo release = ReleaseInfo.fromJson(const <String, Object?>{
         'latest_version': '0.0.0',
         'min_supported_version': '0.0.0',
         'download_url': '',
@@ -180,7 +180,7 @@ void main() {
     test('missing latest_version throws ReleaseMetadataException', () {
       expect(
         () => ReleaseInfo.fromJson(
-          <String, Object?>{'min_supported_version': '1.0.0'},
+          const <String, Object?>{'min_supported_version': '1.0.0'},
           platform: 'android',
         ),
         throwsA(isA<ReleaseMetadataException>()
@@ -192,7 +192,7 @@ void main() {
     test('non-semver latest_version throws ReleaseMetadataException', () {
       expect(
         () => ReleaseInfo.fromJson(
-          <String, Object?>{'latest_version': 'not-a-version'},
+          const <String, Object?>{'latest_version': 'not-a-version'},
           platform: 'android',
         ),
         throwsA(isA<ReleaseMetadataException>()),
@@ -200,7 +200,7 @@ void main() {
     });
 
     test('a leading v is accepted', () {
-      final ReleaseInfo release = ReleaseInfo.fromJson(<String, Object?>{
+      final ReleaseInfo release = ReleaseInfo.fromJson(const <String, Object?>{
         'latest_version': 'v1.2.3',
         'min_supported_version': 'v1.0.0',
         'download_url': 'https://cdn.test/app.apk',
@@ -224,7 +224,7 @@ void main() {
     });
 
     test('coerces scalar types and defaults optional fields', () {
-      final ReleaseInfo release = ReleaseInfo.fromJson(<String, Object?>{
+      final ReleaseInfo release = ReleaseInfo.fromJson(const <String, Object?>{
         'latest_version': '1.2.0',
         'size_bytes': '123',
         'force_update': 1,
@@ -261,7 +261,7 @@ void main() {
     });
 
     test('toJson round-trip keeps every contract key', () {
-      final ReleaseInfo release = ReleaseInfo.fromJson(<String, Object?>{
+      final ReleaseInfo release = ReleaseInfo.fromJson(const <String, Object?>{
         'latest_version': '1.2.0',
         'min_supported_version': '1.1.0',
         'download_url': 'https://cdn.test/app.apk',

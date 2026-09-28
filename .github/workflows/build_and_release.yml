@@ -172,12 +172,13 @@ jobs:
       # Gate the release on static analysis and the test suite. Both run before
       # the APK is built, so a broken build can never be published as a release.
       #
-      # --fatal-warnings (rather than --fatal-infos): errors and warnings fail
-      # the build, while info-level style lints in the test sources do not block
-      # a release. The analysis_options.yaml promotions (unused_import,
-      # unawaited_futures, unused_element) still apply at their severities.
+      # `flutter analyze` already defaults --fatal-infos and --fatal-warnings to
+      # on (see flutter_tools/lib/src/commands/analyze.dart), so passing them
+      # changes no behaviour today. They are spelled out so the gate stays
+      # self-documenting instead of silently depending on a Flutter default that
+      # has moved across releases.
       - name: Analyze
-        run: flutter analyze --fatal-warnings
+        run: flutter analyze --fatal-infos --fatal-warnings
 
       - name: Run the test suite
         run: flutter test --reporter expanded
