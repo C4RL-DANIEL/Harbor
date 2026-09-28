@@ -8,15 +8,18 @@
 // dashboard), which is why the workflow resolves dependencies with
 // `flutter pub get` before invoking `dart test`.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:test/test.dart';
 import 'package:http/http.dart' as http;
 import 'package:pub_semver/pub_semver.dart';
+import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:update_server/src/admin_api_client.dart';
 import 'package:update_server/src/api_router.dart';
+import 'package:update_server/src/lifecycle.dart';
 import 'package:update_server/src/models.dart';
 import 'package:update_server/src/release_store.dart';
 
@@ -651,6 +654,83 @@ void main() {
         headers: <String, String>{'if-none-match': flags.headers['etag']!},
       );
       expect(cached.statusCode, 304);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // InFlightTracker — the shutdown drain counter used by bin/server.dart
+  // ---------------------------------------------------------------------------
+
+  group('in-flight tracking', () {
+    test('drained completes immediately when nothing is running', () async {
+      final InFlightTracker tracker = InFlightTracker();
+      expect(tracker.active, 0);
+      await tracker.drained.timeout(const Duration(seconds: 1));
+      expect(tracker.active, 0);
+    });
+
+    test('active reflects concurrent requests and drained waits for all',
+        () async {
+      final InFlightTracker tracker = InFlightTracker();
+      final Completer<void> releaseFirst = Completer<void>();
+      final Completer<void> releaseSecond = Completer<void>();
+      final List<String> order = <String>[];
+
+      final Future<Response> first = tracker.track(() async {
+        await releaseFirst.future;
+        order.add('first');
+        return Response.ok('first');
+      });
+      final Future<Response> second = tracker.track(() async {
+        await releaseSecond.future;
+        order.add('second');
+        return Response.ok('second');
+      });
+
+      expect(tracker.active, 2);
+
+      bool drained = false;
+      final Future<void> drain = tracker.drained.then((_) {
+        drained = true;
+      });
+      await pumpEventQueue();
+      expect(drained, isFalse, reason: 'two requests are still in flight');
+
+      releaseFirst.complete();
+      await first;
+      expect(tracker.active, 1);
+      await pumpEventQueue();
+      expect(drained, isFalse, reason: 'one request is still in flight');
+
+      releaseSecond.complete();
+      await second;
+      await drain;
+      expect(tracker.active, 0);
+      expect(drained, isTrue);
+      expect(order, <String>['first', 'second']);
+    });
+
+    test('a throwing request still releases its slot', () async {
+      final InFlightTracker tracker = InFlightTracker();
+      await expectLater(
+        tracker.track(() async => throw StateError('boom')),
+        throwsA(isA<StateError>()),
+      );
+      expect(tracker.active, 0);
+      await tracker.drained.timeout(const Duration(seconds: 1));
+    });
+
+    test('wrap counts every request the pipeline runs', () async {
+      final InFlightTracker tracker = InFlightTracker();
+      final Handler handler = tracker.wrap((Request request) async {
+        expect(tracker.active, 1);
+        return Response.ok('wrapped');
+      });
+
+      final Response response =
+          await handler(Request('GET', Uri.parse('http://localhost/health')));
+      expect(response.statusCode, 200);
+      expect(tracker.active, 0);
     });
   });
 }

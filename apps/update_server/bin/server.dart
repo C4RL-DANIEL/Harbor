@@ -14,6 +14,7 @@ import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_static/shelf_static.dart';
 
 import 'package:update_server/src/api_router.dart';
+import 'package:update_server/src/lifecycle.dart';
 import 'package:update_server/src/models.dart';
 import 'package:update_server/src/release_store.dart';
 
@@ -22,6 +23,12 @@ const String _serviceName = 'harbor-update-server';
 /// The token accepted when `HARBOR_ALLOW_DEV_TOKEN=true` and no real token is
 /// configured. Never enable this in production.
 const String _devAdminToken = 'dev';
+
+/// Upper bound on each step of a SIGTERM/SIGINT shutdown: how long stopping the
+/// listener may take, and how long in-flight requests are given to finish
+/// before their sockets are destroyed. A shutdown therefore completes in at
+/// most roughly twice this value.
+const Duration _shutdownGrace = Duration(seconds: 5);
 
 void main(List<String> arguments) async {
   final ArgParser parser = _buildArgParser();
@@ -72,11 +79,13 @@ void main(List<String> arguments) async {
     adminToken: adminToken,
     log: _log,
   );
+  final InFlightTracker tracker = InFlightTracker();
   final Handler handler = const Pipeline()
       .addMiddleware(_logMiddleware(_log))
       .addMiddleware(corsMiddleware())
       .addMiddleware(apiErrorMiddleware(_log))
       .addMiddleware(etagMiddleware())
+      .addMiddleware(tracker.wrap)
       .addHandler(_composeHandler(router, webDirectory));
 
   final HttpServer server;
@@ -109,7 +118,14 @@ void main(List<String> arguments) async {
     _log('no build/web found; serving the JSON landing page at /');
   }
 
-  await _awaitShutdown(server, store);
+  await _awaitShutdown(server, store, tracker);
+
+  // Signal subscriptions and the HTTP server keep the Dart event loop alive
+  // after main() returns, so a process that only awaits its shutdown work
+  // would linger until the supervisor SIGKILLs it. Terminate explicitly once
+  // the state has been flushed.
+  await stdout.flush();
+  exit(0);
 }
 
 ArgParser _buildArgParser() {
@@ -301,18 +317,51 @@ Middleware _logMiddleware(void Function(String) log) {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-Future<void> _awaitShutdown(HttpServer server, ReleaseStore store) async {
+Future<void> _awaitShutdown(
+  HttpServer server,
+  ReleaseStore store,
+  InFlightTracker tracker,
+) async {
   final Completer<void> finished = Completer<void>();
+  bool started = false;
 
   Future<void> shutdown(String signal) async {
-    if (finished.isCompleted) {
+    if (started) {
+      _log('ignoring $signal: shutdown is already in progress');
       return;
     }
-    finished.complete();
-    _log('received $signal; closing server');
-    await server.close(force: false);
-    await store.flush();
-    _log('state flushed; shutdown complete');
+    started = true;
+    _log('received $signal; stopping the listener');
+    try {
+      // 1. Stop accepting connections. Requests already being served continue.
+      try {
+        await server.close(force: false).timeout(_shutdownGrace);
+      } on TimeoutException {
+        _log('stopping the listener exceeded ${_shutdownGrace.inSeconds}s');
+      }
+
+      // 2. Give those requests a bounded window to finish, so a client is not
+      //    cut off by the exit that follows.
+      try {
+        await tracker.drained.timeout(_shutdownGrace);
+      } on TimeoutException {
+        _log('${tracker.active} request(s) still in flight after '
+            '${_shutdownGrace.inSeconds}s; forcing connections closed');
+      }
+
+      // 3. Destroy whatever is left, then persist state.
+      try {
+        await server.close(force: true);
+      } on Object catch (error) {
+        stderr.writeln('Force-closing connections failed: $error');
+      }
+      await store.flush();
+      _log('state flushed; shutdown complete');
+    } on Object catch (error, stackTrace) {
+      stderr.writeln('Shutdown failed: $error\n$stackTrace');
+    } finally {
+      finished.complete();
+    }
   }
 
   ProcessSignal.sigint.watch().listen((_) {

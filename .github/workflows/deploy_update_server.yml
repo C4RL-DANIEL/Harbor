@@ -51,6 +51,7 @@ jobs:
   verify-server:
     name: Analyze and test update server
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/update_server
@@ -131,6 +132,7 @@ jobs:
   build-admin-web:
     name: Build and deploy admin dashboard
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: verify-server
     if: ${{ needs.verify-server.result == 'success' }}
     environment:
@@ -355,6 +357,7 @@ jobs:
   publish-server-image:
     name: Compile and smoke-test shelf server
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: verify-server
     # Manual dispatch always builds the binary; pushes only when the
     # HARBOR_PUBLISH_IMAGE repository variable is exactly 'true'.
@@ -408,8 +411,32 @@ jobs:
           export PORT="${PORT}"
           export HARBOR_STATE_FILE="${state_dir}/state.json"
 
-          # Always tear the server down, even on early failure.
-          trap 'if [ -n "${server_pid:-}" ]; then kill "${server_pid}" 2>/dev/null || true; wait "${server_pid}" 2>/dev/null || true; fi' EXIT
+          # Always tear the server down, even on early failure. `wait` has no
+          # timeout of its own, so a server that ignored SIGTERM could hold the
+          # step — and the runner — until the job timeout; this bounds the
+          # teardown and escalates to SIGKILL.
+          terminate_server() {
+            if [ -z "${server_pid:-}" ]; then
+              return 0
+            fi
+            kill "${server_pid}" 2>/dev/null || true
+            for _ in $(seq 1 10); do
+              state=""
+              if [ -r "/proc/${server_pid}/stat" ]; then
+                state="$(awk '{ print $3 }' "/proc/${server_pid}/stat" 2>/dev/null || true)"
+              fi
+              # `kill -0` also succeeds for a zombie, so compare the process
+              # state instead of mere existence.
+              if [ -z "${state}" ] || [ "${state}" = "Z" ]; then
+                break
+              fi
+              sleep 1
+            done
+            kill -9 "${server_pid}" 2>/dev/null || true
+            wait "${server_pid}" 2>/dev/null || true
+            server_pid=""
+          }
+          trap terminate_server EXIT
 
           "$binary" >"$log_file" 2>&1 &
           server_pid=$!

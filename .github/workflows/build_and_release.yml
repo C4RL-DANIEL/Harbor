@@ -49,6 +49,7 @@ jobs:
   build-apk:
     name: Build release APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: apps/main_app
@@ -365,6 +366,7 @@ jobs:
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: build-apk
     if: ${{ inputs.dry_run != true && needs.build-apk.result == 'success' && needs.build-apk.outputs.tag != '' && needs.build-apk.outputs.sha256 != '' && needs.build-apk.outputs.apk_path != '' }}
     steps:
@@ -449,6 +451,7 @@ jobs:
   publish-pages:
     name: Publish update manifest to GitHub Pages
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: build-apk
     if: ${{ inputs.dry_run != true && needs.build-apk.result == 'success' && needs.build-apk.outputs.sha256 != '' && needs.build-apk.outputs.version != '' }}
     environment:
