@@ -21,6 +21,45 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
+// ---------------------------------------------------------------------------
+// Plugin compile-SDK alignment
+// ---------------------------------------------------------------------------
+// Every Flutter plugin is its own Gradle module and compiles with its own
+// `android.compileSdkVersion`, which is frequently far below the app's:
+// ota_update 6.0.0 still declares `compileSdkVersion 28`. That plugin also
+// depends on androidx.legacy:legacy-support-v4, which drags in a modern
+// androidx.core whose resources reference `android:attr/lStar` — an attribute
+// introduced in API 31. AAPT resolves resources against the *module's* compile
+// SDK, so the release build aborts in `:ota_update:verifyReleaseResources`
+// with "AAPT: error: resource android:attr/lStar not found" even though the
+// app itself compiles against SDK 34.
+//
+// Raising every plugin module to the app's own compile SDK removes the mismatch
+// without patching anything in the pub cache. The value is read back from :app
+// (which the `evaluationDependsOn` above has already evaluated, and which in
+// turn took it from the Flutter Gradle plugin's `flutter.compileSdkVersion`),
+// so this file never hard-codes a second SDK number that could drift from the
+// real toolchain. `:app` itself resolves to a no-op comparison.
+subprojects { subproject ->
+    afterEvaluate { evaluated ->
+        def androidExtension = evaluated.extensions.findByName('android')
+        if (androidExtension == null) {
+            return
+        }
+        def appAndroid = rootProject.project(':app').extensions.findByName('android')
+        if (appAndroid == null) {
+            return
+        }
+        def appCompileSdk = appAndroid.compileSdk
+        if (appCompileSdk != null && androidExtension.compileSdk != appCompileSdk) {
+            evaluated.logger.lifecycle(
+                "Harbor: aligning ${evaluated.path} compileSdk " +
+                "${androidExtension.compileSdk} -> ${appCompileSdk}")
+            androidExtension.compileSdk = appCompileSdk
+        }
+    }
+}
+
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }
