@@ -518,6 +518,7 @@ class FeatureFlagProvider extends ChangeNotifier {
         try {
           _matrix = FeatureFlagMatrix.parse(cached);
           _source = 'cache';
+          _emitChange();
         } on FlagParseException catch (e) {
           _lastError = 'discarded corrupt cached matrix: ${e.message}';
           await prefs.remove(cacheKey);
@@ -540,6 +541,7 @@ class FeatureFlagProvider extends ChangeNotifier {
     if (_matrix.version == 0 && _seed != null) {
       _matrix = _seed;
       _source = 'built-in';
+      _emitChange();
     }
     _initialised = true;
     _notify();
@@ -585,6 +587,7 @@ class FeatureFlagProvider extends ChangeNotifier {
         _matrix = fetched;
         _source = 'network';
         _lastSyncedAt = DateTime.now().toUtc();
+        _emitChange();
         await _persistMatrix(fetched);
       }
       _lastError = null;
@@ -818,6 +821,19 @@ class FeatureFlagProvider extends ChangeNotifier {
   void _notify() {
     if (!_disposed) {
       notifyListeners();
+    }
+  }
+
+  /// Publishes the current matrix on [changes].
+  ///
+  /// Only matrix *replacements* are published, so a subscriber sees one event
+  /// per actual change rather than one per [notifyListeners] call; a local
+  /// override changing the resolved value of a flag does not replace the
+  /// matrix and so does not emit here. [changes] is a broadcast stream, so
+  /// this drops the event when nobody is listening rather than buffering it.
+  void _emitChange() {
+    if (!_disposed) {
+      _changes.add(_matrix);
     }
   }
 

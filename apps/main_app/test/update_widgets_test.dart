@@ -189,10 +189,15 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('Update required'), findsOneWidget);
 
-      final bool popped = await navKey.currentState!.maybePop();
+      // Navigator.maybePop returns whether the pop request was *handled*, not
+      // whether the route was popped: a PopScope that vetoes the pop yields
+      // RoutePopDisposition.doNotPop, which returns true "but does not do
+      // anything beyond that" (see the maybePop docs in navigator.dart). So the
+      // meaningful assertion is that the dialog survived, not the return value.
+      final bool handled = await navKey.currentState!.maybePop();
       await tester.pumpAndSettle();
 
-      expect(popped, isFalse);
+      expect(handled, isTrue);
       expect(find.text('Update required'), findsOneWidget);
     });
 

@@ -780,6 +780,10 @@ void main() {
             http.Response(_matrixJson(version: 1), 200)),
       );
       await provider.initialize();
+      // initialize() only restores the cache, overrides and seed by design; the
+      // network snapshot arrives from refresh(), which is what the app calls
+      // next at startup (see HarborServices in main.dart).
+      await provider.refresh();
 
       final Map<String, Object?> described = provider.describe();
       expect(
