@@ -22,7 +22,14 @@
 #   SITE_DIR                 (required) directory to assemble the site into
 #   REPO                     (required) owner/name, used in manifest URLs
 #   API_BASE_URL             (required) origin the dashboard calls
-#   ADMIN_BASE_HREF          (default /update-admin/) dashboard base href
+#   ADMIN_BASE_HREF          (default /update-admin/) the dashboard's *absolute*
+#                            base href, including any Pages project prefix —
+#                            a project site serves from /<repo>/, so the value
+#                            is typically /<repo>/update-admin/
+#   ADMIN_DIR                (optional) directory the dashboard is staged into
+#                            inside the artifact; defaults to the last segment
+#                            of ADMIN_BASE_HREF, because the artifact root is
+#                            already the Pages base path
 #   MIN_SUPPORTED_VERSION    (optional) defaults to VERSION
 #   VERSION, TAG, SHA256,    (optional group) when all four are present the
 #   SIZE_BYTES, CHANGELOG_FILE, PUBLISHED_AT   manifest is written; otherwise it
@@ -38,8 +45,10 @@ api_base_url="${API_BASE_URL:?API_BASE_URL must be set}"
 admin_base_href="${ADMIN_BASE_HREF:-/update-admin/}"
 
 # ---------------------------------------------------------------------------
-# Normalise the base href: it must start and end with exactly one slash, and
-# the directory it names is the dashboard's subdirectory inside the site.
+# Normalise the base href: it must start and end with exactly one slash. The
+# dashboard is staged into the *last* segment of that href, because the artifact
+# root is already the Pages base path — the same artifact that a project site
+# serves from /<repo>/ must not contain a second /<repo>/ directory.
 # ---------------------------------------------------------------------------
 case "${admin_base_href}" in
   /*) ;;
@@ -52,8 +61,15 @@ esac
 if [ "${admin_base_href}" = "//" ]; then
   admin_base_href="/update-admin/"
 fi
-admin_dir_name="${admin_base_href#/}"
-admin_dir_name="${admin_dir_name%/}"
+
+if [ -n "${ADMIN_DIR:-}" ]; then
+  admin_dir_name="${ADMIN_DIR}"
+  admin_dir_name="${admin_dir_name#/}"
+  admin_dir_name="${admin_dir_name%/}"
+else
+  admin_dir_name="${admin_base_href%/}"
+  admin_dir_name="${admin_dir_name##*/}"
+fi
 if [ -z "${admin_dir_name}" ]; then
   echo "::error::ADMIN_BASE_HREF '${admin_base_href}' does not name a directory." >&2
   exit 1

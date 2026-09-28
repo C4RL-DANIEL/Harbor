@@ -38,9 +38,11 @@ env:
   FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
   # Name of the single artifact bundle shared by the release and pages jobs.
   RELEASE_ARTIFACT_NAME: 'harbor-release-assets'
-  # Subdirectory the admin dashboard is served from. It must start and end with
-  # a slash, and it is kept identical to deploy_update_server.yml so both
-  # workflows assemble exactly the same site layout.
+  # Site-relative subdirectory the dashboard is served from. The absolute base
+  # href handed to `flutter build web` is this value prefixed with the Pages
+  # project path reported by actions/configure-pages (a project site is served
+  # from /<repo>/, so the href is /<repo>/update-admin/). It is kept identical
+  # to deploy_update_server.yml so both workflows assemble the same layout.
   ADMIN_BASE_HREF: '/update-admin/'
 
 jobs:
@@ -463,6 +465,7 @@ jobs:
           path: release-assets
 
       - name: Configure GitHub Pages
+        id: pages
         uses: actions/configure-pages@v5
 
       - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
@@ -472,12 +475,14 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
-      - name: Resolve dashboard API base URL
+      - name: Resolve dashboard build settings
         id: api
         shell: bash
         env:
           API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
           FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
+          ADMIN_SUBDIR: ${{ env.ADMIN_BASE_HREF }}
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
         run: |
           set -euo pipefail
           api_base_url="${API_BASE_URL:-}"
@@ -485,8 +490,41 @@ jobs:
             api_base_url="${FALLBACK}"
             echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
           fi
-          echo "api_base_url=${api_base_url}" >> "$GITHUB_OUTPUT"
-          echo "Dashboard will call ${api_base_url}."
+
+          # actions/configure-pages reports the path the site is served from:
+          # empty for a user/organisation site, "/<repo>" for a project site.
+          # The dashboard is served under that path, so its absolute base href
+          # is base_path + subdirectory; omitting the prefix yields a page whose
+          # index.html loads but whose main.dart.js 404s.
+          base_path="${PAGES_BASE_PATH:-}"
+          if [ "$base_path" = "/" ]; then
+            base_path=""
+          fi
+          case "$base_path" in
+            "") ;;
+            /*) ;;
+            *) base_path="/${base_path}" ;;
+          esac
+          base_path="${base_path%/}"
+
+          subdir="${ADMIN_SUBDIR:-}"
+          case "$subdir" in
+            /*) ;;
+            *) subdir="/${subdir}" ;;
+          esac
+          case "$subdir" in
+            */) ;;
+            *) subdir="${subdir}/" ;;
+          esac
+          if [ "$subdir" = "//" ] || [ "$subdir" = "/" ]; then
+            subdir="/update-admin/"
+          fi
+
+          {
+            echo "api_base_url=${api_base_url}"
+            echo "base_href=${base_path}${subdir}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Dashboard will call ${api_base_url} and be served from ${base_path}${subdir}."
 
       # actions/deploy-pages replaces the whole site, so this job publishes the
       # complete site — the dashboard that deploy_update_server.yml owns plus
@@ -497,7 +535,7 @@ jobs:
           SITE_DIR: ${{ github.workspace }}/site
           REPO: ${{ github.repository }}
           API_BASE_URL: ${{ steps.api.outputs.api_base_url }}
-          ADMIN_BASE_HREF: ${{ env.ADMIN_BASE_HREF }}
+          ADMIN_BASE_HREF: ${{ steps.api.outputs.base_href }}
           MIN_SUPPORTED_VERSION: ${{ vars.HARBOR_MIN_SUPPORTED_VERSION }}
           VERSION: ${{ needs.build-apk.outputs.version }}
           TAG: ${{ needs.build-apk.outputs.tag }}
@@ -512,7 +550,7 @@ jobs:
           VERSION: ${{ needs.build-apk.outputs.version }}
           TAG: ${{ needs.build-apk.outputs.tag }}
           SIZE_BYTES: ${{ needs.build-apk.outputs.size_bytes }}
-          ADMIN_BASE_HREF: ${{ env.ADMIN_BASE_HREF }}
+          ADMIN_BASE_HREF: ${{ steps.api.outputs.base_href }}
         run: |
           set -euo pipefail
           {

@@ -17,12 +17,14 @@ permissions:
   pages: write
   id-token: write
 
-# Only one GitHub Pages deployment may run at a time. This group name is shared
-# with build_and_release.yml on purpose: both workflows replace the same Pages
-# site, so serialising them repository-wide is what keeps their deploys from
-# racing. Queued runs wait rather than cancelling a deploy that is publishing.
+# Serialise this workflow's own deploys. It is deliberately *not* the same
+# group as build_and_release.yml: entering a concurrency group cancels any run
+# still pending in it, so a shared group would let a server push cancel a queued
+# (and expensive) release build. Overlapping deploys from the two workflows are
+# harmless because each one publishes the complete site — see
+# .github/scripts/build_pages_site.sh.
 concurrency:
-  group: pages
+  group: pages-update-server
   cancel-in-progress: false
 
 env:
@@ -37,7 +39,10 @@ env:
   # Documented fallback used when HARBOR_API_BASE_URL is unset. This is the
   # origin the web dashboard calls for the admin API.
   FALLBACK_API_BASE_URL: 'https://harbor-update-server.example.com'
-  # Base href must start and end with a slash; /update-admin/ is the default.
+  # Site-relative subdirectory the dashboard is served from. The absolute base
+  # href passed to `flutter build web` is this value prefixed with the Pages
+  # project path reported by actions/configure-pages (a project site is served
+  # from /<repo>/, so the href is /<repo>/update-admin/ and not /update-admin/).
   ADMIN_BASE_HREF: '/update-admin/'
   # Port for the compiled-server smoke test.
   SMOKE_TEST_PORT: '8080'
@@ -164,13 +169,18 @@ jobs:
       - name: Resolve Flutter dependencies
         run: flutter pub get
 
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
       - name: Resolve web build settings
         id: settings
         shell: bash
         env:
           API_BASE_URL: ${{ vars.HARBOR_API_BASE_URL }}
           FALLBACK: ${{ env.FALLBACK_API_BASE_URL }}
-          BASE_HREF: ${{ env.ADMIN_BASE_HREF }}
+          ADMIN_SUBDIR: ${{ env.ADMIN_BASE_HREF }}
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
         run: |
           set -euo pipefail
 
@@ -180,20 +190,39 @@ jobs:
             echo "::warning::Repository variable HARBOR_API_BASE_URL is empty; falling back to ${api_base_url}."
           fi
 
-          # Normalize the base href so an empty or malformed value cannot break
-          # the web build: it must start and end with a single slash.
-          base_href="${BASE_HREF:-}"
-          case "$base_href" in
-            /*) ;;
-            *) base_href="/${base_href}" ;;
-          esac
-          case "$base_href" in
-            */) ;;
-            *) base_href="${base_href}/" ;;
-          esac
-          if [ "$base_href" = "//" ] || [ -z "$base_href" ]; then
-            base_href="/update-admin/"
+          # actions/configure-pages reports the path the site is served from:
+          # empty for a user/organisation site, "/<repo>" for a project site.
+          # The dashboard lives under that path, so its absolute base href is
+          # base_path + subdirectory. Getting this wrong produces a page whose
+          # index.html loads but whose main.dart.js is requested from the
+          # domain root and 404s.
+          base_path="${PAGES_BASE_PATH:-}"
+          if [ "$base_path" = "/" ]; then
+            base_path=""
           fi
+          case "$base_path" in
+            "") ;;
+            /*) ;;
+            *) base_path="/${base_path}" ;;
+          esac
+          base_path="${base_path%/}"
+
+          # Normalise the subdirectory so an empty or malformed value cannot
+          # break the web build: it must start and end with a single slash.
+          subdir="${ADMIN_SUBDIR:-}"
+          case "$subdir" in
+            /*) ;;
+            *) subdir="/${subdir}" ;;
+          esac
+          case "$subdir" in
+            */) ;;
+            *) subdir="${subdir}/" ;;
+          esac
+          if [ "$subdir" = "//" ] || [ "$subdir" = "/" ]; then
+            subdir="/update-admin/"
+          fi
+
+          base_href="${base_path}${subdir}"
 
           {
             echo "api_base_url=${api_base_url}"
@@ -292,9 +321,6 @@ jobs:
           PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
           CHANGELOG_FILE: ${{ steps.release.outputs.changelog_file }}
         run: bash "${{ github.workspace }}/.github/scripts/build_pages_site.sh"
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
