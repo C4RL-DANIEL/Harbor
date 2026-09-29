@@ -306,6 +306,9 @@ void main() {
     await tester.tap(find.text('Run demo.echo'));
     await tester.pumpAndSettle();
 
+    // The result card renders below the run button inside the expanded tile, so
+    // scroll to it before asserting; this is a no-op if it is already visible.
+    await _scrollTo(tester, find.textContaining('echo=hi'));
     expect(find.textContaining('echo=hi'), findsOneWidget);
   });
 

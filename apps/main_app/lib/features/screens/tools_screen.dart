@@ -495,7 +495,7 @@ class _ToolFormState extends State<_ToolForm> {
     final Widget field;
     if (type == 'boolean') {
       field = SwitchListTile(
-        key: ValueKey<String>('$widget.tool.name.$key.switch'),
+        key: ValueKey<String>('${widget.tool.name}.$key.switch'),
         contentPadding: EdgeInsets.zero,
         title: Text(label),
         subtitle: helper == null ? null : Text(helper),
@@ -509,7 +509,7 @@ class _ToolFormState extends State<_ToolForm> {
     } else if (enumValues is List<Object?>) {
       final List<String> options = enumValues.whereType<String>().toList();
       field = DropdownButtonFormField<String>(
-        key: ValueKey<String>('$widget.tool.name.$key.enum'),
+        key: ValueKey<String>('${widget.tool.name}.$key.enum'),
         value: _enums[key],
         decoration: InputDecoration(labelText: label, helperText: helper),
         items: <DropdownMenuItem<String>>[
@@ -529,21 +529,21 @@ class _ToolFormState extends State<_ToolForm> {
       );
     } else if (type == 'integer' || type == 'number') {
       field = TextFormField(
-        key: ValueKey<String>('$widget.tool.name.$key.number'),
+        key: ValueKey<String>('${widget.tool.name}.$key.number'),
         controller: _text[key],
         keyboardType: TextInputType.number,
         decoration: InputDecoration(labelText: label, helperText: helper),
       );
     } else {
       field = TextFormField(
-        key: ValueKey<String>('$widget.tool.name.$key.text'),
+        key: ValueKey<String>('${widget.tool.name}.$key.text'),
         controller: _text[key],
         decoration: InputDecoration(labelText: label, helperText: helper),
       );
     }
     final String? message = _errors[key];
     return Padding(
-      key: ValueKey<String>('$widget.tool.name.$key.row'),
+      key: ValueKey<String>('${widget.tool.name}.$key.row'),
       padding: const EdgeInsets.only(bottom: 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -551,7 +551,7 @@ class _ToolFormState extends State<_ToolForm> {
           field,
           if (message != null)
             Padding(
-              key: ValueKey<String>('$widget.tool.name.$key.error'),
+              key: ValueKey<String>('${widget.tool.name}.$key.error'),
               padding: const EdgeInsets.only(top: 4, left: 12),
               child: Text(
                 message,
