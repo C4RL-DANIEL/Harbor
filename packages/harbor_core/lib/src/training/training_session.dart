@@ -249,6 +249,17 @@ class TrainingConfig {
     if (warmupSteps < 0) {
       throw ArgumentError.value(warmupSteps, 'warmupSteps', 'must not be negative');
     }
+    if (warmupSteps > totalSteps) {
+      // A warmup longer than the run means the schedule never reaches its peak
+      // learning rate and then decays from a value it never used. Accepting it
+      // would silently change the training curve into something nobody asked
+      // for, so it is rejected at the call site instead.
+      throw ArgumentError.value(
+        warmupSteps,
+        'warmupSteps',
+        'must not exceed totalSteps ($totalSteps)',
+      );
+    }
     if (checkpointEvery < 1) {
       throw ArgumentError.value(
         checkpointEvery,

@@ -4,10 +4,10 @@
 // the tokenizer and weights on disk, the corpus store front end, the tool
 // runner, the chat transcript, and the training runner. Everything is
 // deterministic: the model config is the tiny test preset, the corpus is a
-// fixed block of prose, the chat model is a stub that emits one byte and then
-// the end-of-sequence token, and every training run is four steps. No test
-// touches the network, and every file written lives under a freshly created
-// `Directory.systemTemp` root that is removed on teardown.
+// fixed block of prose, the chat model is a stub that always wants to stop, and
+// every training run is four steps. No test touches the network, and every file
+// written lives under a freshly created `Directory.systemTemp` root that is
+// removed on teardown.
 
 import 'dart:async';
 import 'dart:io';
@@ -25,9 +25,9 @@ import 'package:main_app/core/training/training_controller.dart';
 
 /// A little under a kilobyte of ordinary English prose.
 ///
-/// The exact content does not matter, only that it is long enough for the
-/// tokenizer to find repeated byte pairs and long enough that its token count
-/// clears the default training window. It deliberately contains no e-mail
+/// The exact content does not matter, only that it is long enough that its
+/// token count clears the default training window and comfortably exercises the
+/// runtime's tokenizer and model paths. It deliberately contains no e-mail
 /// address, phone number or long opaque token, so `TextRedactor.redact` is the
 /// identity on it and an assertion such as `trainingText().contains(_prose)`
 /// is meaningful.
@@ -205,6 +205,11 @@ class _EosBiasedModel implements LanguageModelRuntime {
 }
 
 /// Builds a [ChatController] over the stub model and a bare byte tokenizer.
+///
+/// The engine's context window is deliberately much larger than the rendered
+/// prompt: at the default 256 tokens the system instruction alone fills the
+/// window and the prompt renderer trims the user's message away before
+/// generation, which would make the transcript assertion meaningless.
 ChatController _chatController() {
   final ByteTokenizer tokenizer = ByteTokenizer();
   final ChatEngine engine = ChatEngine(
@@ -213,6 +218,7 @@ ChatController _chatController() {
       eosId: tokenizer.eosId,
     ),
     tokenizer: tokenizer,
+    contextLength: 4096,
   );
   final ChatController controller = ChatController(
     engine: engine,

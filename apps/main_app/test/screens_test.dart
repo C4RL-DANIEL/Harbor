@@ -141,6 +141,19 @@ ChatController _buildChatController() {
 /// Every collaborator the four screens need, wired with the cheapest viable
 /// arguments. The model runtime is deliberately never bootstrapped, so it stays
 /// un-ready and the training screen renders its readiness warning.
+/// Scrolls the first scrollable until [finder] matches, then stops.
+///
+/// `scrollUntilVisible` checks the current tree before scrolling, so this is a
+/// no-op for content that is already on screen.
+Future<void> _scrollTo(WidgetTester tester, Finder finder) async {
+  await tester.scrollUntilVisible(
+    finder,
+    400,
+    scrollable: find.byType(Scrollable).first,
+    maxScrolls: 80,
+  );
+}
+
 class _Harness {
   _Harness._({
     required this.runtime,
@@ -303,8 +316,13 @@ void main() {
     await tester.pumpWidget(_app(CorpusScreen(controller: harness.corpus)));
     await tester.pumpAndSettle();
 
-    expect(find.text('No documents yet'), findsOneWidget);
+    // The document list sits below the stats and the collection controls, and a
+    // ListView does not build what is off-screen, so the assertions have to
+    // scroll to it first.
+    await _scrollTo(tester, find.text('Documents (0)'));
     expect(find.text('Documents (0)'), findsOneWidget);
+    await _scrollTo(tester, find.text('No documents yet'));
+    expect(find.text('No documents yet'), findsOneWidget);
 
     final bool added = await harness.corpus.addText(
       'some sufficiently long text for the corpus to accept it',
@@ -312,6 +330,7 @@ void main() {
     await tester.pump();
 
     expect(added, isTrue);
+    await _scrollTo(tester, find.text('user-input'));
     expect(find.text('user-input'), findsOneWidget);
     expect(find.text('Documents (1)'), findsOneWidget);
   });

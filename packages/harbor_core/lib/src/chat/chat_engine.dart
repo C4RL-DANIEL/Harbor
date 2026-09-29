@@ -342,17 +342,34 @@ class ChatEngine {
       }
     }
 
-    // Drop whole messages from the left until the transcript fits. Trimming by
-    // message rather than by token keeps the result readable, and the system
-    // line is never dropped because losing the instructions mid-conversation
-    // changes the model's behaviour completely.
-    String candidate = '$buffer${lines.join('\n')}\nAssistant:';
-    while (lines.length > 1 &&
-        tokenizer.encode(candidate).length > contextLength) {
-      lines.removeAt(0);
-      candidate = '$buffer${lines.join('\n')}\nAssistant:';
+    // Drop whole messages from the left until the transcript fits the budget.
+    // Trimming by message rather than by token keeps the result readable, and the
+    // system line is never dropped because losing the instructions
+    // mid-conversation changes the model's behaviour completely.
+    //
+    // The newest user turn is never dropped either. An earlier revision trimmed
+    // purely by length, so on a small window it removed the question and kept the
+    // older answers — leaving the model to continue a conversation whose subject
+    // it could no longer see, which is why every reply looked like fluent
+    // nonsense.
+    final int budget = promptBudget;
+    final int lastUser =
+        history.lastIndexWhere((ChatMessage m) => m.role == ChatRole.user);
+    int keepFrom = 0;
+    String candidate = _assemble(buffer, lines);
+    while (tokenizer.encode(candidate).length > budget) {
+      if (lastUser < 0 || keepFrom >= lastUser) {
+        break;
+      }
+      keepFrom++;
+      candidate = _assemble(buffer, lines.sublist(keepFrom));
     }
     return candidate;
+  }
+
+  /// Joins the system preamble and the transcript into the final prompt.
+  static String _assemble(StringBuffer preamble, List<String> lines) {
+    return '$preamble${lines.join('\n')}\nAssistant:';
   }
 
   Future<ToolResult> _invoke(ToolCall call) async {
