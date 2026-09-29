@@ -16,8 +16,17 @@ import 'package:flutter/material.dart';
 
 import '../core/agent/extended_thinking.dart';
 import '../core/agent/file_readers.dart';
+import '../core/chat/chat_controller.dart';
+import '../core/corpus/corpus_controller.dart';
+import '../core/model/harbor_model_runtime.dart';
+import '../core/tools/tools_controller.dart';
+import '../core/training/training_controller.dart';
 import '../core/update_engine/dynamic_feature_flag_provider.dart';
 import '../core/update_engine/update_service.dart';
+import 'screens/chat_screen.dart';
+import 'screens/corpus_screen.dart';
+import 'screens/tools_screen.dart';
+import 'screens/training_screen.dart';
 
 /// Signature every dynamic module widget implements.
 typedef DynamicModuleBuilder = Widget Function(
@@ -34,6 +43,11 @@ class DynamicModuleContext {
     required this.agent,
     required this.updateService,
     required this.currentUpdateResult,
+    this.chat,
+    this.tools,
+    this.training,
+    this.corpus,
+    this.modelRuntime,
   });
 
   /// Live feature-flag store, usable for additional in-module gating.
@@ -50,6 +64,26 @@ class DynamicModuleContext {
 
   /// Result of the most recent update check, if any.
   final UpdateCheckResult? currentUpdateResult;
+
+  // The four fields below are optional so that a layout can still be built by a
+  // caller that has no model at all — a preview, a test, a widget gallery. A
+  // panel whose controller is absent renders an explanation instead of a
+  // silently empty frame.
+
+  /// The chat controller, when a model is available.
+  final ChatController? chat;
+
+  /// The tool controller.
+  final ToolsController? tools;
+
+  /// The training controller.
+  final TrainingController? training;
+
+  /// The corpus controller.
+  final CorpusController? corpus;
+
+  /// The model runtime the training panel reports on.
+  final HarborModelRuntime? modelRuntime;
 }
 
 /// Resolves module types to widgets and renders whole layouts.
@@ -140,6 +174,43 @@ class DynamicModuleRegistry {
         _ThinkingPanelCard(module: m, context: ctx),
     'banner': (BuildContext c, DynamicModule m, DynamicModuleContext ctx) =>
         _ServerBannerCard(module: m),
+    // The four panels below let the server place the model's own surfaces
+    // anywhere in the workspace. They are registered but not part of the
+    // default layout: the app already has dedicated tabs for them, and a
+    // workspace that duplicates every tab by default is noise, not features.
+    'chat_panel': (BuildContext c, DynamicModule m, DynamicModuleContext ctx) =>
+        _EmbeddedPanel(
+      module: m,
+      missing: 'This build has no chat controller.',
+      child: ctx.chat == null ? null : ChatScreen(controller: ctx.chat!),
+    ),
+    'tools_panel': (BuildContext c, DynamicModule m, DynamicModuleContext ctx) =>
+        _EmbeddedPanel(
+      module: m,
+      missing: 'This build has no tool controller.',
+      child: ctx.tools == null ? null : ToolsScreen(controller: ctx.tools!),
+    ),
+    'training_panel': (
+      BuildContext c,
+      DynamicModule m,
+      DynamicModuleContext ctx,
+    ) =>
+        _EmbeddedPanel(
+      module: m,
+      missing: 'This build has no training controller.',
+      child: ctx.training == null || ctx.modelRuntime == null
+          ? null
+          : TrainingScreen(
+              controller: ctx.training!,
+              runtime: ctx.modelRuntime!,
+            ),
+    ),
+    'corpus_panel': (BuildContext c, DynamicModule m, DynamicModuleContext ctx) =>
+        _EmbeddedPanel(
+      module: m,
+      missing: 'This build has no corpus controller.',
+      child: ctx.corpus == null ? null : CorpusScreen(controller: ctx.corpus!),
+    ),
   };
 }
 
@@ -168,6 +239,47 @@ class _SectionHeader extends StatelessWidget {
 }
 
 /// Base card shared by every module, honouring server-supplied titles.
+/// A full screen embedded inside the server-driven workspace.
+///
+/// The height is fixed because the workspace is a `ListView`: an embedded
+/// screen that grows without bound would make the list scroll inside itself.
+/// 560 logical pixels is roughly one phone screen, which is enough to use the
+/// panel without turning the workspace into a maze.
+class _EmbeddedPanel extends StatelessWidget {
+  const _EmbeddedPanel({
+    required this.module,
+    required this.child,
+    required this.missing,
+  });
+
+  /// Roughly one phone screen, which is enough to use a panel without turning
+  /// the workspace into a maze. It is a constant because every panel wants the
+  /// same value; a per-panel height would be a knob with no reason to exist.
+  static const double _height = 560;
+
+  final DynamicModule module;
+
+  /// The screen to embed, or null when the controller is absent.
+  final Widget? child;
+
+  /// What to say when there is nothing to embed.
+  final String missing;
+
+  @override
+  Widget build(BuildContext context) {
+    final Widget? embedded = child;
+    return _ModuleCard(
+      module: module,
+      child: embedded == null
+          ? Text(
+              missing,
+              style: Theme.of(context).textTheme.bodySmall,
+            )
+          : SizedBox(height: _height, child: embedded),
+    );
+  }
+}
+
 class _ModuleCard extends StatelessWidget {
   const _ModuleCard({
     required this.module,

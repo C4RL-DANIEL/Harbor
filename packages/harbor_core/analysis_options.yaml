@@ -1,0 +1,47 @@
+# Harbor Core analysis configuration.
+#
+# CI runs `dart analyze --fatal-infos --fatal-warnings`, so every lint below is
+# a build failure rather than a suggestion. The rule set mirrors the Flutter
+# applications in this monorepo so a style violation is reported identically
+# wherever it appears.
+include: package:lints/recommended.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  errors:
+    # Anything the linter would merely warn about is promoted to an error, so a
+    # local `dart analyze` reports exactly what CI reports.
+    todo: ignore
+
+linter:
+  rules:
+    - always_declare_return_types
+    - avoid_dynamic_calls
+    - avoid_empty_else
+    - avoid_print
+    - avoid_relative_lib_imports
+    - avoid_returning_null_for_void
+    - avoid_type_to_string
+    - avoid_unused_constructor_parameters
+    - cancel_subscriptions
+    - close_sinks
+    - comment_references
+    - directives_ordering
+    - empty_statements
+    - join_return_with_assignment
+    - literal_only_boolean_expressions
+    - no_adjacent_strings_in_list
+    # NOTE: `omit_local_variable_types` is deliberately NOT enabled. The two
+    # Flutter applications in this monorepo annotate every local, and this
+    # package is imported by both, so requiring the opposite style here would
+    # produce a codebase that reads inconsistently across a single feature.
+    - prefer_final_in_for_each
+    - prefer_final_locals
+    - prefer_single_quotes
+    - require_trailing_commas
+    - unnecessary_lambdas
+    - use_named_constants
+    - valid_regexps

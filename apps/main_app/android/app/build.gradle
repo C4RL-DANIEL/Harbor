@@ -124,3 +124,15 @@ android {
 flutter {
     source '../..'
 }
+
+// ---------------------------------------------------------------------------
+// Platform-channel dependencies
+// ---------------------------------------------------------------------------
+// PlatformChannelHandler and TrainingService use NotificationCompat,
+// NotificationManagerCompat, ContextCompat and ActivityCompat directly. These
+// arrive transitively through Flutter/other plugins, but depending on that
+// accident is fragile; naming androidx.core:core-ktx here puts the reviewed
+// version on the compile classpath explicitly.
+dependencies {
+    implementation "androidx.core:core-ktx:1.13.1"
+}

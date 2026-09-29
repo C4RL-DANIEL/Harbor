@@ -243,3 +243,91 @@ Errors are always JSON: { "error": "<message>" } with 400/401/404/500.
   * Semver comparisons use package:pub_semver, never hand-rolled string compare.
   * Secrets (admin token, API base URL) come from environment/dart-define only.
 ================================================================================
+================================================================================
+7. ADDENDUM — v1.3.0 (model, corpus, chat, tools)
+================================================================================
+
+  This addendum extends the contract above; it does not replace it. Where the
+  two disagree about a wire shape, this section is the newer statement.
+
+SHARED RUNTIME
+  packages/harbor_core is the single implementation of the model, the BPE
+  tokenizer, the corpus store, the tool layer and the chat engine. It MUST stay
+  free of both dart:io and Flutter so the same source compiles to the Android
+  AOT image, the Dart VM and the browser bundle. Platform and filesystem work
+  lives in apps/main_app (Flutter/dart:io) and apps/update_server (dart:io)
+  respectively.
+
+  Two-stage training is part of the contract:
+    * no adapter attached  -> every parameter is trainable (pretrain from scratch)
+    * adapter attached     -> the base is frozen and only the LoRA factors are
+                              trainable; `parameters` MUST return exactly the
+                              adapter tensors, because that list is what the
+                              optimizer iterates.
+
+  There is no pretrained checkpoint in this repository and none is fetched at
+  runtime. Every surface that reports model state MUST report
+  `stage: "untrained"`.
+
+WIRE CONTRACT ADDITIONS (Component B)
+
+  GET /api/v1/chat/status
+    200 -> { "ready": bool, "stage": "untrained", "vocabulary": int,
+             "parameters": int, "layers": int, "context_length": int,
+             "seed_documents": int, "seed_chars": int,
+             "max_new_tokens": int }
+
+  POST /api/v1/chat
+    request  { "messages": [ { "role": "user"|"assistant"|"system"|"tool",
+                               "content": string, "name": string? } ],
+               "max_tokens": int? }
+    limits   max 24 messages; max_tokens declared int, 1..512, default 160
+    200 -> { "text": string, "generated_tokens": int, "stop_reason": string,
+             "model": <the chat/status object> }
+    400 -> standard error envelope for: empty/malformed body, unknown role,
+           too many messages, non-integer max_tokens
+    500 -> standard error envelope when the engine reports a failure
+
+  POST /api/v1/chat?stream=true   (or Accept: text/event-stream)
+    200  Content-Type: text/event-stream
+         data: {"type":"token","text":string}
+         data: {"type":"tool_started","name":string}
+         data: {"type":"tool_finished","name":string,"ok":bool,"summary":string}
+         data: {"type":"finished","text":string,"generated_tokens":int,
+                "stop_reason":string}
+         data: {"type":"failed","message":string}
+         data: [DONE]
+    A failure after the stream is committed arrives as an in-band `failed`
+    event, because the status line has already been sent.
+
+  GET /api/v1/tools
+    200 -> { "tools": [ { "name": string, "description": string,
+                          "mutating": bool, "parameters": object } ] }
+    The catalogue includes device tools. On the server they resolve through the
+    documented "unsupported" path (the host caller returns null); a tool that
+    cannot run MUST say so rather than fabricate a reading.
+
+CLIENT UI CONTRACT ADDITIONS
+  The client navigation is: Workspace, Chat, Learn (Training | Corpus), Tools,
+  Settings. The engine diagnostics live behind an AppBar action rather than a
+  sixth destination.
+
+  Dynamic module types the registry MUST resolve (in addition to the existing
+  set): chat_panel, tools_panel, training_panel, corpus_panel. As with every
+  module type, an unregistered type renders the visible placeholder rather than
+  disappearing.
+
+  The Training tab's progress MUST drive three outputs from the one stream:
+  the in-app loss chart, the Android foreground notification (throttled), and a
+  durable JSONL log entry per finished round.
+
+HONESTY REQUIREMENTS (normative)
+  * No surface may claim the model was pretrained, fine-tuned from a checkpoint,
+    or trained on data it never saw.
+  * "Self-learning" MUST NOT be used for the idle scheduler's adapter trainer
+    unless the supervision signal is real text. Fitting an adapter to a randomly
+    initialised module's output is not learning.
+  * Device-tool results shown to a user MUST come from the platform channel or
+    be reported as unsupported/failed; they must never be synthesised.
+  * Docs and UI MUST state that model-emitted tool calls are best-effort and
+    that the deterministic intent router is the dependable path.

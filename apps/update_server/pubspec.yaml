@@ -4,7 +4,7 @@ description: >-
   metadata and the dynamic feature-flag matrix, plus a Flutter Web admin
   dashboard (lib/main.dart) that edits that state live.
 publish_to: "none"
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -32,6 +32,13 @@ dependencies:
   # ---- Browser bindings (lib/main.dart only) -----------------------------
   # Replaces the deprecated dart:html for the web-only admin dashboard.
   web: ^1.0.0
+
+  # ---- Shared model and tool runtime ------------------------------------
+  # Harbor's model, tokenizer, corpus and tool layer. It is deliberately free
+  # of both dart:io and Flutter so the same source compiles to the server VM,
+  # the Android AOT image and the browser bundle the dashboard runs.
+  harbor_core:
+    path: ../../packages/harbor_core
 
 dev_dependencies:
   # `package:test` (not flutter_test) drives test/server_test.dart so the suite

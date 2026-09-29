@@ -4,10 +4,12 @@
 
 import 'dart:convert';
 
+import 'package:harbor_core/harbor_core.dart';
 import 'package:pub_semver/pub_semver.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
 
+import 'chat_service.dart';
 import 'models.dart';
 import 'release_store.dart';
 
@@ -62,12 +64,18 @@ Middleware apiErrorMiddleware(void Function(String) log) {
 ///
 /// [adminToken] is the token required by every mutating admin route. An empty
 /// token disables admin mutations with HTTP 503 rather than accepting anything.
+///
+/// [chatService] is the optional model host behind the `/api/v1/chat` routes.
+/// When omitted a default, lazily-initialised service is used, so existing call
+/// sites and tests keep working without knowing about chat at all.
 Router buildRouter({
   required ReleaseStore store,
   required String adminToken,
   void Function(String) log = _noopLog,
+  HarborChatService? chatService,
 }) {
   final Router router = Router();
+  final HarborChatService service = chatService ?? HarborChatService();
 
   router.get('/health', (Request request) => _health(store));
   router.get(
@@ -96,6 +104,20 @@ Router buildRouter({
   router.get(
     '/latest_version.json',
     (Request request) => _latestVersionJson(store),
+  );
+  router.get(
+    '/api/v1/chat/status',
+    (Request request) => jsonResponse(service.status()),
+  );
+  router.get(
+    '/api/v1/tools',
+    (Request request) => jsonResponse(<String, Object?>{
+      'tools': service.toolRegistry.describe(),
+    }),
+  );
+  router.post(
+    '/api/v1/chat',
+    (Request request) => _chat(request, service, log),
   );
 
   // Catch-all so unknown routes answer with the JSON error envelope.
@@ -173,9 +195,14 @@ Handler buildApiHandler({
   required String adminToken,
   void Function(String) log = _noopLog,
   bool includeEtag = true,
+  HarborChatService? chatService,
 }) {
-  final Router router =
-      buildRouter(store: store, adminToken: adminToken, log: log);
+  final Router router = buildRouter(
+    store: store,
+    adminToken: adminToken,
+    log: log,
+    chatService: chatService,
+  );
   Pipeline pipeline = const Pipeline().addMiddleware(apiErrorMiddleware(log));
   if (includeEtag) {
     pipeline = pipeline.addMiddleware(etagMiddleware());
@@ -385,6 +412,241 @@ Future<Response> _latestVersionJson(ReleaseStore store) async {
     platform: release.platform,
   );
   return jsonResponse(response.toJson(generatedAt: generatedAt));
+}
+
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
+
+/// Serves one `POST /api/v1/chat`, streaming or buffered by request.
+Future<Response> _chat(
+  Request request,
+  HarborChatService service,
+  void Function(String) log,
+) async {
+  final _ChatRequest parsed = await _readChatRequest(request);
+  if (_wantsEventStream(request)) {
+    return _streamingChat(parsed, service, log);
+  }
+  return _bufferedChat(parsed, service);
+}
+
+/// Parses and validates the chat request body.
+///
+/// Every failure is a [ValidationException], so a malformed request reaches the
+/// client as a 400 with the same `{"error": ...}` envelope as the rest of the
+/// API rather than as an unhandled exception.
+Future<_ChatRequest> _readChatRequest(Request request) async {
+  final String raw = await request.readAsString();
+  if (raw.trim().isEmpty) {
+    throw const ValidationException('request body must not be empty');
+  }
+  final Object? decoded;
+  try {
+    decoded = jsonDecode(raw);
+  } on FormatException catch (error) {
+    throw ValidationException(
+      'request body is not valid JSON: ${error.message}',
+    );
+  }
+  if (decoded is! Map<String, Object?>) {
+    throw const ValidationException('request body must be a JSON object');
+  }
+
+  final Object? rawMessages = decoded['messages'];
+  if (rawMessages is! List<Object?>) {
+    throw const ValidationException(
+      '"messages" is required and must be an array',
+    );
+  }
+  if (rawMessages.isEmpty) {
+    throw const ValidationException(
+      '"messages" must contain at least one message',
+    );
+  }
+  if (rawMessages.length > kChatMessageLimit) {
+    throw ValidationException(
+      '"messages" must contain at most $kChatMessageLimit messages, got '
+      '${rawMessages.length}',
+    );
+  }
+
+  final List<ChatMessage> messages = <ChatMessage>[];
+  for (int i = 0; i < rawMessages.length; i++) {
+    final Object? entry = rawMessages[i];
+    if (entry is! Map<String, Object?>) {
+      throw ValidationException('message $i must be a JSON object');
+    }
+    try {
+      messages.add(ChatMessage.fromJson(entry));
+    } on FormatException catch (error) {
+      throw ValidationException('message $i: ${error.message}');
+    }
+  }
+
+  return _ChatRequest(
+    messages: messages,
+    maxTokens: _readMaxTokens(decoded['max_tokens']),
+  );
+}
+
+/// Reads `max_tokens`, defaulting it and capping it at [kChatMaxTokensCap].
+///
+/// The cap is applied rather than rejected because a client asking for "as much
+/// as possible" should still get a bounded answer; only a value that is not an
+/// integer, or one that asks for no output at all, is a client error.
+int _readMaxTokens(Object? value) {
+  if (value == null) {
+    return kChatDefaultMaxTokens;
+  }
+  if (value is! int) {
+    throw const ValidationException('"max_tokens" must be an integer');
+  }
+  if (value < 1) {
+    throw const ValidationException('"max_tokens" must be at least 1');
+  }
+  return value > kChatMaxTokensCap ? kChatMaxTokensCap : value;
+}
+
+/// Whether the client asked for server-sent events.
+///
+/// Both `?stream=true` and `Accept: text/event-stream` are honored because a
+/// browser `EventSource` cannot set headers while a hand-rolled client usually
+/// prefers to.
+bool _wantsEventStream(Request request) {
+  final String? stream = request.url.queryParameters['stream'];
+  if (stream != null && stream.toLowerCase() == 'true') {
+    return true;
+  }
+  final String? accept = request.headers['accept'];
+  return accept != null && accept.toLowerCase().contains('text/event-stream');
+}
+
+/// Streams the turn as `text/event-stream`.
+Response _streamingChat(
+  _ChatRequest parsed,
+  HarborChatService service,
+  void Function(String) log,
+) {
+  final Stream<ChatEvent> events = service.respond(
+    parsed.messages,
+    maxNewTokens: parsed.maxTokens,
+  );
+  return Response.ok(
+    _sseStream(events, log),
+    headers: const <String, String>{
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+    },
+  );
+}
+
+/// Renders [events] as SSE frames and terminates the stream with `[DONE]`.
+///
+/// The stream is already committed to HTTP 200 by the time events arrive, so a
+/// failure is reported in-band as a `failed` event instead of being allowed to
+/// tear down the connection without explanation.
+Stream<List<int>> _sseStream(
+  Stream<ChatEvent> events,
+  void Function(String) log,
+) async* {
+  try {
+    await for (final ChatEvent event in events) {
+      yield utf8.encode('data: ${jsonEncode(_ssePayload(event))}\n\n');
+    }
+  } on Object catch (error) {
+    log('chat stream failed: $error');
+    yield utf8.encode(
+      'data: ${jsonEncode(<String, Object?>{
+        'type': 'failed',
+        'message': '$error',
+      })}\n\n',
+    );
+  }
+  yield utf8.encode('data: [DONE]\n\n');
+}
+
+/// The wire form of one [ChatEvent].
+Map<String, Object?> _ssePayload(ChatEvent event) => switch (event) {
+      ChatToken(:final String text) =>
+        <String, Object?>{'type': 'token', 'text': text},
+      ChatToolStarted(:final ToolCall call) =>
+        <String, Object?>{'type': 'tool_started', 'name': call.name},
+      ChatToolFinished(:final ToolCall call, :final ToolResult result) =>
+        <String, Object?>{
+          'type': 'tool_finished',
+          'name': call.name,
+          'ok': result.ok,
+          'summary': result.summary,
+        },
+      ChatFinished(
+        :final String text,
+        :final int generatedTokens,
+        :final String? stopReason,
+      ) =>
+        <String, Object?>{
+          'type': 'finished',
+          'text': text,
+          'generated_tokens': generatedTokens,
+          'stop_reason': stopReason,
+        },
+      ChatFailed(:final String message) =>
+        <String, Object?>{'type': 'failed', 'message': message},
+    };
+
+/// Runs the turn to completion and answers with the whole reply.
+Future<Response> _bufferedChat(
+  _ChatRequest parsed,
+  HarborChatService service,
+) async {
+  final StringBuffer streamed = StringBuffer();
+  ChatFinished? finished;
+  String? failure;
+  await for (final ChatEvent event in service.respond(
+    parsed.messages,
+    maxNewTokens: parsed.maxTokens,
+  )) {
+    switch (event) {
+      case ChatToken(:final String text):
+        streamed.write(text);
+      case ChatFinished():
+        finished = event;
+      case ChatFailed(:final String message):
+        failure = message;
+      case ChatToolStarted():
+      case ChatToolFinished():
+        break;
+    }
+  }
+
+  final String? problem = failure;
+  if (problem != null) {
+    throw ApiException(500, 'chat failed: $problem');
+  }
+  final ChatFinished? result = finished;
+  if (result == null) {
+    throw const ApiException(500, 'chat produced no result');
+  }
+  return jsonResponse(<String, Object?>{
+    // A tool-only turn can finish with its markup stripped away to nothing; the
+    // concatenated tokens are then the most faithful thing left to return.
+    'text': result.text.isEmpty ? streamed.toString() : result.text,
+    'generated_tokens': result.generatedTokens,
+    'stop_reason': result.stopReason,
+    'model': service.status(),
+  });
+}
+
+/// A validated chat request.
+class _ChatRequest {
+  const _ChatRequest({required this.messages, required this.maxTokens});
+
+  /// The conversation, oldest first.
+  final List<ChatMessage> messages;
+
+  /// The token budget for this turn.
+  final int maxTokens;
 }
 
 // ---------------------------------------------------------------------------

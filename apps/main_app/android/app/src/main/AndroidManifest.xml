@@ -22,6 +22,23 @@
         android:maxSdkVersion="32"/>
 
     <!-- =====================================================================
+         Platform-channel permissions.
+         ===================================================================== -->
+
+    <!-- device.vibrate. Normal permission, granted at install time. -->
+    <uses-permission android:name="android.permission.VIBRATE"/>
+
+    <!-- device.notify and the TrainingService foreground notification. Ignored
+         below API 33, where notifications need no runtime permission. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!-- TrainingService is a started foreground service. The *_DATA_SYNC
+         permission is required from API 34 for a service declared with
+         android:foregroundServiceType="dataSync", and is ignored below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+
+    <!-- =====================================================================
          Package visibility (Android 11+).
          ===================================================================== -->
     <queries>
@@ -38,6 +55,14 @@
         </intent>
         <intent>
             <action android:name="android.intent.action.INSTALL_PACKAGE"/>
+        </intent>
+        <!-- device.installedApps resolves launcher activities through
+             queryIntentActivities. This filter is what makes those packages
+             visible under Android 11+ without the (forbidden)
+             QUERY_ALL_PACKAGES permission. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LAUNCHER"/>
         </intent>
     </queries>
 
@@ -70,6 +95,15 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+
+        <!-- Started, foreground service that keeps a long training job alive
+             and visible after the app is backgrounded. Not exported: it is
+             driven only by intents from the app's own platform channel. The
+             dataSync type pairs with FOREGROUND_SERVICE_DATA_SYNC above. -->
+        <service
+            android:name=".TrainingService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
 
         <!-- Do not delete: the Flutter tool uses this to generate
              GeneratedPluginRegistrant.java. -->

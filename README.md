@@ -4,9 +4,10 @@ A production-grade, dual-app Flutter ecosystem in a single monorepo:
 
 | Component | Path | What it is |
 | --- | --- | --- |
-| **Harbor** (client) | `apps/main_app` | A Flutter Android app with an on-device inference engine (MLA + fine-grained MoE + LoRA self-learning), an extended-thinking autonomous agent, a universal file reader, and a self-updating OTA engine. |
+| **Harbor** (client) | `apps/main_app` | A Flutter Android app with a real (small) language model that trains on-device from text the phone and the web gathered, a chat surface, a device-tool layer, an MLA + fine-grained MoE engine, an extended-thinking agent, a universal file reader, and a self-updating OTA engine. |
 | **Harbor Update Server** | `apps/update_server` | A Dart `shelf` service that serves release metadata, the dynamic feature-flag matrix, and a Flutter Web admin dashboard for publishing releases and flipping flags live. |
-| **Release pipeline** | `.github/workflows` | Tag-driven APK build → SHA256 → GitHub Release → `latest_version.json` → GitHub Pages, plus a server verify/deploy pipeline. Both pipelines are green on CI and have published `v1.0.0`; see [§7](#7-verification-status). |
+| **Shared runtime** | `packages/harbor_core` | The model, the BPE tokenizer, the corpus store and collectors, the tool layer and the chat engine. Deliberately free of **both** `dart:io` and Flutter, so the same source compiles to the Android AOT image, the server VM and the browser bundle the dashboard runs. |
+| **Release pipeline** | `.github/workflows` | Tag-driven APK build → SHA256 → GitHub Release → `latest_version.json` → GitHub Pages, plus a server verify/deploy pipeline. Both pipelines are green on CI; see [§7](#7-verification-status). |
 
 The frozen interface between the two apps — the HTTP wire contract, the feature-flag matrix schema and the release-metadata schema — is specified in [`MASTER_PROMPT.txt`](MASTER_PROMPT.txt) §4. Treat it as normative: the client parses exactly those shapes and the server emits exactly those shapes.
 
@@ -38,19 +39,37 @@ The frozen interface between the two apps — the HTTP wire contract, the featur
 │   │   │   │       ├── update_service.dart         # policy, OTA download, SHA256, install
 │   │   │   │       ├── dynamic_feature_flag_provider.dart
 │   │   │   │       └── widgets/update_dialog.dart  # force / soft / progress UI
-│   │   │   ├── features/dynamic_module_registry.dart
+│   │   │   │   ├── model/harbor_model_runtime.dart   # tokenizer + checkpoint on disk
+│   │   │   │   ├── corpus/               # store persistence, device scanner, controller
+│   │   │   │   ├── tools/tools_controller.dart
+│   │   │   │   ├── chat/chat_controller.dart
+│   │   │   │   ├── training/training_controller.dart # progress -> UI + notification + log
+│   │   │   │   └── platform/             # platform channel bridge + real device state
+│   │   │   ├── features/
+│   │   │   │   ├── dynamic_module_registry.dart
+│   │   │   │   └── screens/              # chat, training, tools, corpus
 │   │   │   └── main.dart
+│   │   ├── android/…/PlatformChannelHandler.kt       # device APIs behind one method channel
 │   │   ├── test/                      # unit + widget tests
 │   │   ├── analysis_options.yaml
 │   │   └── pubspec.yaml
 │   └── update_server/
 │       ├── bin/server.dart            # entrypoint (plain Dart VM, no Flutter)
 │       ├── lib/
-│       │   ├── main.dart              # Flutter shell for the Web admin dashboard
-│       │   └── src/                   # models, release_store, api_router, lifecycle (no Flutter)
+│       │   ├── main.dart              # Flutter Web dashboard, including a browser-side chat
+│       │   └── src/                   # models, release_store, api_router, chat_service
 │       ├── test/
 │       ├── web/
 │       └── pubspec.yaml
+├── packages/harbor_core/              # Flutter-free AND dart:io-free shared runtime
+│   ├── lib/
+│   │   ├── src/model/                 # tiny_lm, blocks (MLA/MoE/Linear+LoRA), linalg, encoding
+│   │   ├── src/tokenizer/             # byte-level BPE
+│   │   ├── src/corpus/                # documents, store, device text, HTML, web collector
+│   │   ├── src/tools/                 # tool protocol, registry, device tools, web tools
+│   │   ├── src/chat/                  # messages, tool protocol, chat engine
+│   │   └── src/training/              # AdamW, training session with cosine schedule
+│   └── test/
 ├── MASTER_PROMPT.txt                  # normative spec + frozen wire contract (§4)
 └── README.md
 ```
@@ -86,17 +105,28 @@ Implements the DeepSeek-V2/V3-style low-rank KV compression:
   (normalised against `ln(n)`) and a `toJson` matching the documented contract. A perfectly
   uniform load scores exactly `1.0`.
 
-### 2.3 `on_device_lora.dart` — background self-learning
+### 2.3 `on_device_lora.dart` — the LoRA mechanics
+
+> **Read this before the bullet list.** This file no longer trains the model. An earlier
+> revision called it "self-learning", but what it actually did was seed its replay buffer
+> from a **randomly initialised** `MultiHeadLatentAttention` and then fit the adapter to that
+> module's output — training the adapter to imitate noise and calling the result learning.
+> That seeding has been deleted, not relabelled. The file is kept because the Engine tab
+> plots its LoRA/AdamW internals and because the math is worth testing, and the *real*
+> learner is now `packages/harbor_core` ([§2.8](#28-packagesharbor_core--the-model-that-actually-learns)).
+> The `IdleTrainingScheduler` still owns the training gate, but the gate now guards a real
+> `TrainingSession` over real gathered text.
 
 - `y = W₀·x + (α/rank)·B·(A·x)` with `A ~ N(0, σ²)` and **`B = 0`**, so a freshly created
   adapter is a provable identity — merging it changes nothing (asserted bit-for-bit).
 - `mergeInto` / `unmergeFrom` fold the adapter into a weight copy and back out again.
-- Analytical backprop through the LoRA branch only (the frozen base weights are never
-  updated), AdamW with decoupled weight decay and global-norm clipping.
+- Analytical backprop through the LoRA branch only, AdamW with decoupled weight decay and
+  global-norm clipping. The freeze is enforced where it matters — in the parameter list the
+  optimizer iterates — so "frozen base" is a property of the update set, not a comment.
 - A bounded replay buffer with reservoir replacement, plus an `IdleTrainingScheduler` that
-  trains **only** when every guard passes: idle ∧ charging ∧ battery ≥ 0.35 ∧ thermal ≤ fair
-  ∧ daily compute budget remaining ∧ non-empty replay. Consecutive failures disable the
-  scheduler rather than looping on a broken adapter.
+  gates training on: idle ∧ charging ∧ battery ≥ 0.35 ∧ thermal ≤ fair ∧ daily compute
+  budget remaining ∧ non-empty input. Consecutive failures disable the scheduler rather than
+  looping on a broken adapter.
 - `FileLoraAdapterStore` persists adapters as JSON; `toJson`/`fromJson` round-trip `A` and
   `B` exactly and reject truncated tensors.
 
@@ -212,6 +242,78 @@ against the registry, and the server suite checks the published copy against the
 
 ---
 
+### 2.8 `packages/harbor_core` — the model that actually learns
+
+The package is Flutter-free **and `dart:io`-free**. That is not tidiness for its own sake:
+the identical source compiles to the Android AOT image (the app), the Dart VM (the update
+server) and the browser bundle (the admin dashboard's chat pane). A single `dart:io` import
+anywhere in the model path would break one of the three.
+
+| File | What it contains |
+| --- | --- |
+| `model/linalg.dart` | row-major `Matrix` with parallel gradient storage, `softmax`, `gelu`, layer norm forward/backward, rotary embeddings |
+| `model/blocks.dart` | `Linear` (+LoRA), `MlaAttention` (full-sequence and incremental decode), `MoeFfn` with a shared expert and top-K routed experts |
+| `model/tiny_lm.dart` | `TinyLmConfig`, the layer stack, forward/backward, `evaluateWindow`/`accumulateWindow`, `logitsFor` (cold replay + warm one-token fast path), `generate`, adapter attach/merge, JSON checkpointing |
+| `tokenizer/byte_tokenizer.dart` | byte-level BPE: `BpeMerge`, `BpeTrainer`, `ByteTokenizer.train` |
+| `corpus/` | `CorpusDocument`/`CorpusStore` (content-addressed, quota-bounded), device text extraction and redaction, HTML-to-text, an HTTP collector that obeys robots.txt and a byte ceiling |
+| `tools/` | `Tool`/`FunctionTool`, `ToolRegistry`, `deviceTools(HostCaller)` (16 Android capabilities), `webTools` (fetch/check/json) |
+| `chat/` | `ChatMessage`, a `<tool name="…">…</tool>` protocol, and `ChatEngine` — routed intents first, then generation, then any model-emitted call |
+| `training/` | `AdamW` with decoupled decay and global-norm clipping, and `TrainingSession` (warmup + cosine schedule, gradient clipping, checkpoint callback, pause/cancel, a broadcast progress stream) |
+
+**Architecture.** Per layer, pre-norm residuals: `h ← h + MLA(LN(h))`, `h ← h + MoE(LN(h))`.
+MLA compresses the KV cache by projecting each token to a shared low-rank latent
+`c = W_dkv·x` and caching `c` plus the post-rotation key/value; `forwardStep` is O(T) per
+token and a test asserts it agrees with the full-sequence reference path. MoE routes each
+token to `topK` of `numExperts` with a shared expert always active.
+
+**Training is two-stage, and the difference is the whole point.**
+1. *Pretrain from scratch* (no adapter): every parameter is updated. This is what the app
+   does when you press **Start training** — on gathered text, from random initialisation.
+2. *Continual learning* (`attachAdapter`): the base is frozen and only the LoRA factors move.
+   `TinyLm.parameters` returns exactly the adapter tensors while an adapter is attached, so
+   the freeze is enforced by the optimizer's update set, not by convention.
+
+**What it is not.** There is no pretrained checkpoint anywhere in this repository. A model
+trained here has seen only the text this device gathered (or, for the dashboard, the bundled
+seed corpus), so it is a real but small language model that will happily produce fluent,
+confident and wrong text. `TinyLmConfig.onDevicePreset` is ~a few million parameters, not
+billions. The reliable device behaviour lives in the Tools tab, which never consults the
+model.
+
+### 2.9 Where the training text comes from
+
+- **Device** (`core/corpus/device_collector.dart`): walks a small set of roots (the app's own
+  directory, plus `Download`, `Documents` and `EXTERNAL_STORAGE` on Android), reads text-like
+  files through `DeviceTextExtractor`, redacts credential-shaped strings through
+  `TextRedactor`, and reports denied roots, skipped files and errors instead of a bare count.
+  Directories it cannot read on Android 11+ are recorded as *denied*, because "0 documents
+  found" and "permission refused" are different facts and conflating them is the single most
+  confusing thing a data-gathering feature can do.
+- **Web** (`core/corpus/web_collector.dart`): https only, an empty host allow-list means any
+  host, robots.txt respected, redirects and response size capped, HTML reduced to text.
+- **User**: pasted text, added through the Corpus tab.
+- Everything is content-addressed (SHA-256 of the text) so the same page pasted twice is
+  stored once, and the store enforces a document ceiling, a per-document ceiling and a total
+  byte quota. Nothing is uploaded anywhere.
+
+### 2.10 Chat, tools, and what the assistant can actually do
+
+`ChatEngine` answers in three ways, in this order: a **deterministic intent router** (e.g.
+"what is my battery level", "copy X to the clipboard"), then ordinary generation from the
+on-device model, then any tool call the model itself emitted in the
+`<tool name="…">{…}</tool>` form. The router exists because a few-million-parameter model
+trained on a phone's own notes will not reliably emit valid calls, and a battery reading is
+too useful to make contingent on that. Model-emitted calls are best-effort; the router and
+the Tools tab are the dependable paths, and the UI says so.
+
+On Android, tools execute through **one** method channel
+(`com.harbor.main_app/platform`) handled by `PlatformChannelHandler.kt`: battery, storage,
+connectivity, display, thermal, locale, clipboard read/write, notifications, vibration,
+toast, share, installed apps, opening a URL or an app, plus the training notification.
+`PlatformBridge.call(method, args)` is the only bridge method; off-platform it reports
+`{"unavailable": true}` rather than throwing, which the tool layer turns into an explicit
+*unsupported* result — distinct from a failure.
+
 ## 3. Component B — the update server
 
 A plain-Dart `shelf` service. `bin/server.dart` and everything under `lib/src/` are
@@ -256,7 +358,27 @@ All mutations require the `X-Admin-Token` header:
 Admins can adjust the minimum supported version, publish release metadata, trigger a forced
 update, and toggle flags live. Mutations are what the admin dashboard drives.
 
-### 3.3 The admin dashboard
+### 3.3 Model endpoints
+
+The server also hosts the same model runtime from `packages/harbor_core`, so the
+wire contract and the client's own engine cannot drift apart.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/chat/status` | model shape: `ready`, `stage` (`untrained`), `vocabulary`, `parameters`, `layers`, `context_length`, `seed_documents`, `seed_chars`, `max_new_tokens` |
+| `POST /api/v1/chat` | one turn. Body `{"messages":[{"role":"user","content":"…"}],"max_tokens":160}`. Returns `{"text":…,"generated_tokens":…,"stop_reason":…,"model":{…}}`. With `?stream=true` (or `Accept: text/event-stream`) the same route emits `data:` frames — `token`, `tool_started`, `tool_finished`, `finished`, `failed` — terminated by `data: [DONE]` |
+| `GET /api/v1/tools` | the tool catalogue the assistant may reach (names, descriptions, JSON-schema parameters, whether each mutates) |
+
+Every malformed request is a `400` with the standard error envelope: an empty body, an
+unknown role, more than 24 messages, or a non-integer `max_tokens`. `max_tokens` is clamped
+to 512. The device tools appear in the catalogue but cannot execute on the server — there is
+no Android host, so each returns the explicit *unsupported* result rather than pretending to
+have read a battery.
+
+`POST /api/v1/chat` honestly reports `stage: "untrained"`: the server's model is built from a
+small seed corpus and has no pretrained checkpoint, exactly like the client's.
+
+### 3.4 The admin dashboard
 
 `lib/main.dart` is a Flutter Web app that talks to the admin endpoints: edit the minimum
 supported version, publish release metadata, trigger a forced update and flip feature flags —
@@ -269,7 +391,16 @@ default comes from `HARBOR_API_BASE_URL`. The read paths share the client's fall
 Pages site. Admin **mutations** need a live server; against a static host they fail with the
 server's own error, which the dashboard surfaces rather than swallowing.
 
-### 3.4 `latest_version.json`
+The dashboard also has a **Chat** pane, and it is deliberately *not* a thin wrapper over
+`POST /api/v1/chat`: it loads `harbor_core` into the browser through `lib/src/browser_model.dart`
+and runs the model in the tab. That is what makes the GitHub Pages deployment useful — a static
+host has no server to answer, and a chat pane that silently did nothing there would be worse than
+no chat pane. The pane states plainly that the model has no pretrained checkpoint, shows the
+bundled seed corpus it was trained on, and lists the web tools it can actually run. Device tools
+cannot run in a browser at all, so the pane says so and points at the Android app, where they
+execute through the platform channel.
+
+### 3.5 `latest_version.json`
 
 Both the server route `GET /latest_version.json` and the release pipeline's Pages artifact use
 this name, and both carry exactly the §4 release fields. The server adds one extra field,
@@ -551,9 +682,30 @@ found a third class: bugs that no amount of static analysis would have surfaced.
 | 20 | `main.dart` | the built-in default layout named module types (`file_reader`, `lora_lab`) that are **not in `DynamicModuleRegistry`**, and gated modules on undeclared flags. An unregistered type does not vanish — it renders the "unsupported module" placeholder card, so the first screen of a fresh install was a row of dead cards, and a flag-gated module with no matching key is dropped entirely | rebuild the default layout from the registry's real types (`engine_status`, `thinking_panel`, `agent_console`, `file_inspector`, `update_status`, `feature_flags`, `banner`) and the canonical flag keys, and add `dynamic_module_registry_test.dart`, which asserts registry agreement, flag declaration and id uniqueness so this cannot regress |
 | 21 | `build_and_release.yml` | the APK was built with `--build-number` only. Neither `--build-name` nor `HARBOR_APP_VERSION` was passed, so **every** release shipped an APK whose `versionName` and self-reported version were the pubspec's `1.0.0`, while the manifest advertised the tag. A device that installed v1.0.1 would believe it was on 1.0.0, see `update_available: true` forever, and prompt for the update it had already installed | pass `--build-name="${VERSION}"` and `--dart-define=HARBOR_APP_VERSION="${VERSION}"`, so the APK metadata and the value the decision logic compares agree with the published manifest |
 
+The 1.3.0 work added a fourth class: bugs found by *writing the tests for behaviour that had
+never actually been observed*, in the new `packages/harbor_core` model.
+
+| # | Where | Problem | Fix |
+| --- | --- | --- | --- |
+| 22 | `blocks.dart` — `MlaAttention` | Every attention head read the **wrong slice of the key and value vectors**: the offset into the per-position vector was computed as `j * headDim` (the *position* index) instead of `h * headDim` (the *head* index). With `nHeads × headDim` values stored per position, head `h` attended to a neighbouring head's data, and once `j ≥ nHeads` the index ran past the end of the vector and threw `RangeError`. The pre-existing "incremental decode agrees with full forward" test passed throughout, because **both** paths shared the same wrong offset — consistency is not correctness. Found by an end-to-end training test that could not reduce held-out loss | use `h * headDim` in all six sites (full forward, incremental step, and the backward pass), after which the model learns, the gradient check passes, and generation becomes reproducible |
+| 23 | `blocks.dart`, `tiny_lm.dart` | the LoRA freeze was **not enforced**. `Linear.parameters()` returned the base weight and bias *and* the adapter tensors, and `TinyLm.parameters` (which is what `TrainingSession` hands to `AdamW`) included the embedding, the final norm and every base matrix, so attaching an adapter and stepping the optimizer updated the frozen base — making "train the adapter" and "train everything" the same experiment with different names. The parameter-count getters reported a *negative* frozen count, which is what exposed it | while an adapter is attached, `parameters` returns exactly the adapter tensors at both levels; `totalParameterCount` includes the adapter so that `total == frozen + trainable` |
+| 24 | `tiny_lm.dart` | `TinyLmConfig.testPreset` set `vocabSize: 48` while `validate()` requires ≥ 260 (ids 0–255 are raw bytes and 256–259 are the control tokens). The preset could not pass its own validation, and a test asserting `returnsNormally` caught it | raise the preset to 260, the real floor, and say why in the comment |
+| 25 | `chat_engine.dart` | the prompt filled the model's window before a single token was generated, so `respond` returned `stop_reason: context_limit` with **empty text** — an assistant that could never answer. Two causes: the full tool catalogue rendered to well over a thousand tokens against a 96-token window, and nothing reserved room to generate | the engine reserves space to answer (`promptBudget`), and `renderPrompt` degrades the catalogue — full schema → tool names only → no catalogue — taking the first variant that fits, so the prompt the user previews is the prompt the model received. `minNewTokens` also stops an untrained model ending the turn on token one |
+| 26 | `TinyLmConfig.browserPreset` | a 96-token window was too small for a system prompt plus a tool catalogue plus a conversation, which is how (25) surfaced in the first place | 512 tokens, with the O(T) cost of attention stated in the comment |
+
 ### Limits of this verification
 
-- The client's 260 tests and the APK build execute **only on GitHub's x86-64 runners**. The
+- **There is no pretrained checkpoint.** Not "the checkpoint is not downloaded" — there is none
+  in this repository and none is fetched at runtime. A model trained here starts from random
+  initialisation and sees only the text this device gathered, so the honest description is a
+  real but small language model that memorises what it was shown. It is not an assistant
+  comparable to anything trained on a web-scale corpus, and the UI says so in three places
+  (the chat greeting, the training empty state, and the dashboard's honesty card).
+- Model-initiated tool calls are **best-effort**. The `<tool name="…">…</tool>` protocol is parsed
+  and executed, but a few-million-parameter model trained on a phone's own text will not emit
+  valid calls reliably. The deterministic intent router and the Tools screen are the dependable
+  paths; the README says that wherever it claims tool use.
+- The client's tests and the APK build execute **only on GitHub's x86-64 runners**. The
   environment this repository was assembled in has an aarch64 host and an x86-64-only Flutter
   engine, so `flutter test` and `flutter build apk` cannot run locally; the local mirrors are
   used for analysis and for executing the Flutter-free code.

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Channel used by `device.notify`, the generic one-shot notification.
+         Referenced from PlatformChannelHandler.deviceNotify(). -->
+    <string name="harbor_notification_channel_name">Harbor notifications</string>
+    <string name="harbor_notification_channel_description">Status notifications posted by the Harbor app.</string>
+
+    <!-- Channel and copy for the TrainingService foreground notification.
+         Referenced from TrainingService.buildNotification()/ensureChannel(). -->
+    <string name="harbor_training_channel_name">Training</string>
+    <string name="harbor_training_channel_description">Progress of an on-device training job. Runs until the job finishes or you stop it.</string>
+    <string name="harbor_training_default_title">Training in progress</string>
+    <string name="harbor_training_default_text">Preparing the on-device model&#8230;</string>
+    <string name="harbor_training_stop">Stop</string>
+</resources>

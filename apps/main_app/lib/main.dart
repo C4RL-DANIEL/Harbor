@@ -16,22 +16,35 @@
 
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:harbor_core/harbor_core.dart' as hc;
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 import 'core/agent/extended_thinking.dart';
 import 'core/agent/file_readers.dart';
 import 'core/agent/subagent_runner.dart';
+import 'core/chat/chat_controller.dart';
+import 'core/corpus/corpus_controller.dart';
+import 'core/corpus/corpus_persistence.dart';
+import 'core/corpus/device_collector.dart';
 import 'core/engine/fine_grained_moe.dart';
 import 'core/engine/mla_attention.dart';
 import 'core/engine/on_device_lora.dart';
+import 'core/model/harbor_model_runtime.dart';
+import 'core/platform/platform_bridge.dart';
+import 'core/platform/platform_device_state.dart';
+import 'core/tools/tools_controller.dart';
+import 'core/training/training_controller.dart';
 import 'core/update_engine/dynamic_feature_flag_provider.dart';
 import 'core/update_engine/update_service.dart';
 import 'core/update_engine/widgets/update_dialog.dart';
 import 'features/dynamic_module_registry.dart';
+import 'features/screens/chat_screen.dart';
+import 'features/screens/corpus_screen.dart';
+import 'features/screens/tools_screen.dart';
+import 'features/screens/training_screen.dart';
 
 /// Material 3 seed colour for the Harbor brand.
 const Color kHarborSeedColor = Color(0xFF2F6FED);
@@ -197,17 +210,11 @@ class HarborConfig {
       };
 }
 
-/// Source of device conditions for the idle-training scheduler.
-///
-/// The default implementation is manual so the app is fully exercisable without
-/// platform channels; a production build substitutes a battery/thermal-backed
-/// implementation behind this same interface.
-abstract class DeviceStateSource {
-  /// Reads the current device conditions.
-  Future<DeviceState> read();
-}
-
 /// Manually-driven [DeviceStateSource], used for development and testing.
+///
+/// It is the fallback, not the default: on Android the composition root builds a
+/// [PlatformDeviceStateSource] and this one only drives the engine tab's
+/// simulator, so the training gate can be exercised without draining a battery.
 class ManualDeviceStateSource implements DeviceStateSource {
   DeviceState _state = DeviceState.unknown;
 
@@ -239,6 +246,15 @@ class HarborServices {
     required this.updateService,
     required this.flow,
     required this.registry,
+    required this.bridge,
+    required this.httpClient,
+    required this.storage,
+    required this.modelRuntime,
+    required this.corpus,
+    required this.tools,
+    required this.chat,
+    required this.training,
+    required this.platformDeviceState,
   });
 
   final HarborConfig config;
@@ -256,6 +272,35 @@ class HarborServices {
   final UpdateService updateService;
   final UpdateFlowController flow;
   final DynamicModuleRegistry registry;
+  final PlatformBridge bridge;
+
+  /// The HTTP client shared by the web tools and the corpus collector. One
+  /// client for both keeps the connection pool warm, which matters on a phone
+  /// where a fresh TLS handshake per fetch is a visible delay.
+  final http.Client httpClient;
+
+  /// Where the corpus, tokenizer and checkpoint live.
+  final HarborStorageLayout storage;
+
+  /// The on-device model and its tokenizer.
+  final HarborModelRuntime modelRuntime;
+
+  /// Gathered training text.
+  final CorpusController corpus;
+
+  /// Runnable capabilities.
+  final ToolsController tools;
+
+  /// The assistant.
+  final ChatController chat;
+
+  /// The training pipeline.
+  final TrainingController training;
+
+  /// Real battery and thermal readings, or null on a platform that cannot
+  /// provide them. The manual source stays available for the engine tab's
+  /// simulator either way.
+  final DeviceStateSource? platformDeviceState;
 
   /// Result of the launch-time update check, once it completes.
   UpdateCheckResult? lastUpdateCheck;
@@ -269,6 +314,12 @@ class HarborServices {
     flow.dispose();
     flags.dispose();
     updateService.dispose();
+    httpClient.close();
+    chat.dispose();
+    training.dispose();
+    corpus.dispose();
+    tools.dispose();
+    modelRuntime.dispose();
   }
 }
 
@@ -306,7 +357,13 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
   );
   final FineGrainedMoE moe = FineGrainedMoE(moeConfig, seed: 0x00E1);
 
-  // ---- On-device LoRA self-learning -------------------------------------
+  // ---- Legacy engine (diagnostics only) ----------------------------------
+  // These objects are what the Engine tab plots, so the KV-compression ratio
+  // and the expert routing stay inspectable. They do not produce the model's
+  // answers any more. In particular the previous "self-distillation" seeding —
+  // which trained the adapter to imitate a randomly initialised attention
+  // module — has been removed rather than relabelled: fitting noise is worse
+  // than not fitting anything, and the real pipeline learns from text.
   final LoraConfig loraConfig = LoraConfig(
     rank: 8,
     inFeatures: mlaConfig.hiddenSize,
@@ -336,11 +393,6 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
     weightDecay: 0.01,
     maxGradientNorm: 1.0,
   );
-
-  // Self-distillation: the frozen engine's own outputs become the supervision
-  // signal, so background learning sharpens the adapter on the model's actual
-  // behaviour instead of drifting toward an unrelated objective.
-  _seedReplayFromEngine(trainer, attention, mlaConfig);
 
   final ManualDeviceStateSource deviceStateSource = ManualDeviceStateSource();
   final IdleTrainingScheduler scheduler = IdleTrainingScheduler(
@@ -377,8 +429,97 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
   );
   final UpdateFlowController flow = UpdateFlowController(service: updateService);
 
+  // ---- Corpus, model, tools and learning ---------------------------------
+  // The order below is a dependency chain, not a preference: the storage layout
+  // locates the corpus, the corpus trains the tokenizer, the tokenizer sizes the
+  // model, and the model is what chat and training operate on.
+  final PlatformBridge bridge = PlatformBridge();
+  final HarborStorageLayout storage =
+      HarborStorageLayout(Directory('${supportDirectory.path}/harbor'));
+
+  final hc.CorpusStore corpusStore = hc.CorpusStore(
+    storage: FileCorpusStorage(storage.corpusFile),
+  );
+  await corpusStore.load();
+
+  final http.Client httpClient = http.Client();
+  final CorpusController corpus = CorpusController(
+    store: corpusStore,
+    collector: DeviceCorpusCollector(store: corpusStore),
+    webCollector: hc.WebCorpusCollector(
+      client: httpClient,
+      // An empty host allow-list means "any host"; the policy still enforces
+      // https, a byte ceiling, a redirect ceiling and robots.txt.
+      policy: const hc.WebCorpusPolicy(),
+    ),
+    deviceRoots: _corpusRoots(supportDirectory),
+  );
+  await corpus.initialize();
+
+  final HarborModelRuntime modelRuntime =
+      HarborModelRuntime(layout: storage);
+  await modelRuntime.bootstrap(corpusStore.trainingText(maxChars: 24000));
+
+  final hc.ToolRegistry toolRegistry = hc.ToolRegistry(<hc.Tool>[
+    ...hc.deviceTools(hostCallerFrom(bridge)),
+    ...hc.webTools(
+      client: httpClient,
+      allow: (Uri uri) => uri.scheme == 'https',
+      maxBytes: 256 * 1024,
+    ),
+  ]);
+
+  final ToolsController tools = ToolsController(
+    registry: toolRegistry,
+    bridge: bridge,
+  );
+
+  // A vocabulary mismatch between the model and the tokenizer would produce
+  // token ids the embedding table does not have, so the fallback pair is built
+  // to match. It exists only so chat has *something* to run when bootstrapping
+  // failed; the home screen says so rather than letting the app look broken.
+  final hc.ByteTokenizer fallbackTokenizer = hc.ByteTokenizer();
+  final hc.LanguageModelRuntime chatModel = modelRuntime.model ??
+      hc.TinyLm(
+        hc.TinyLmConfig.testPreset
+            .copyWith(vocabSize: fallbackTokenizer.vocabSize),
+      );
+  final hc.Tokenizer chatTokenizer = modelRuntime.tokenizer ?? fallbackTokenizer;
+
+  final ChatController chat = ChatController(
+    engine: hc.ChatEngine(
+      model: chatModel,
+      tokenizer: chatTokenizer,
+      tools: toolRegistry,
+      maxNewTokens: 96,
+      contextLength: modelRuntime.ready
+          ? modelRuntime.config.contextLength
+          : hc.TinyLmConfig.testPreset.contextLength,
+    ),
+    tokenizer: chatTokenizer,
+  );
+
+  final TrainingController training = TrainingController(
+    runtime: modelRuntime,
+    corpus: corpus,
+    bridge: bridge,
+    log: TrainingLog(storage.trainingLogFile),
+  );
+
+  final DeviceStateSource? platformDeviceState =
+      bridge.isSupported ? PlatformDeviceStateSource(bridge) : null;
+
   return HarborServices(
     config: config,
+    bridge: bridge,
+    httpClient: httpClient,
+    storage: storage,
+    modelRuntime: modelRuntime,
+    corpus: corpus,
+    tools: tools,
+    chat: chat,
+    training: training,
+    platformDeviceState: platformDeviceState,
     attention: attention,
     moe: moe,
     adapter: adapter,
@@ -396,29 +537,26 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
   );
 }
 
-/// Fills the trainer's replay buffer with (activation, engine output) pairs.
-void _seedReplayFromEngine(
-  OnDeviceLoRATrainer trainer,
-  MultiHeadLatentAttention attention,
-  MlaConfig config,
-) {
-  final math.Random rng = math.Random(0x5E1F);
-  for (int i = 0; i < 64; i++) {
-    final Float32List input = Float32List(config.hiddenSize);
-    double norm = 0.0;
-    for (int d = 0; d < input.length; d++) {
-      input[d] = rng.nextDouble() * 2.0 - 1.0;
-      norm += input[d] * input[d];
-    }
-    // L2-normalise so activations sit on a comparable scale.
-    final double scale = norm > 0 ? 1.0 / math.sqrt(norm) : 1.0;
-    for (int d = 0; d < input.length; d++) {
-      input[d] = input[d] * scale;
-    }
-    final Float32List target = attention.forward(input, i).output;
-    trainer.addExample(LoraTrainingExample(input: input, target: target));
+/// The directories a device scan may read.
+///
+/// The app's own support directory always works. The shared storage roots are
+/// best-effort: on Android 11 and later a plain `Directory.list` there returns
+/// permission errors for most subdirectories, which the collector records as
+/// denied roots instead of pretending the scan found nothing.
+List<Directory> _corpusRoots(Directory supportDirectory) {
+  final List<Directory> roots = <Directory>[supportDirectory];
+  if (!Platform.isAndroid) {
+    return roots;
   }
-  attention.resetCache();
+  roots.addAll(<Directory>[
+    Directory('/storage/emulated/0/Download'),
+    Directory('/storage/emulated/0/Documents'),
+  ]);
+  final String? external = Platform.environment['EXTERNAL_STORAGE'];
+  if (external != null && external.isNotEmpty) {
+    roots.add(Directory(external));
+  }
+  return roots;
 }
 
 /// Provides [HarborServices] to the widget tree.
@@ -597,25 +735,34 @@ class _HarborHomePageState extends State<HarborHomePage> {
   /// Reads device state into the scheduler and runs a gated round when allowed.
   Future<void> _pollIdleTraining() async {
     final HarborServices services = _services;
-    final DeviceState state = await services.deviceStateSource.read();
+    if (services.training.isRunning) {
+      return;
+    }
+    // The real pipeline, gated on the real phone. `platformDeviceState` reads
+    // the battery and the thermal status through the platform channel; the
+    // manual source is only the fallback for a platform that reports neither,
+    // where the gate then fails closed on unknown power.
+    final DeviceStateSource source =
+        services.platformDeviceState ?? services.deviceStateSource;
+    final DeviceState state = await source.read();
     services.scheduler.updateDeviceState(state);
     if (!services.scheduler.evaluateGate().allowed) {
       return;
     }
-    try {
-      final TrainingRoundReport? report = await services.scheduler.maybeRunRound();
-      if (report != null) {
-        services.lastTrainingRound = report;
-        // Persist the learned adapter so progress survives a restart.
-        await services.adapterStore.save('harbor_default', services.trainer.adapter);
-        if (mounted) {
-          setState(() {});
-        }
-      }
-    } on Object catch (e) {
-      if (services.config.verboseLogging) {
-        debugPrint('Idle training round failed: $e');
-      }
+    if (services.training.readiness != null) {
+      return;
+    }
+    // A deliberately short round. Background learning is worth having only if
+    // it stops before it heats the phone, and because the session checkpoints
+    // as it goes, an interrupted round is still saved progress.
+    await services.training.start(
+      override: services.training.config.copyWith(
+        totalSteps: 40,
+        checkpointEvery: 10,
+      ),
+    );
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -646,6 +793,11 @@ class _HarborHomePageState extends State<HarborHomePage> {
         appBar: AppBar(
           title: const Text('Harbor'),
           actions: <Widget>[
+            IconButton(
+              tooltip: 'Engine diagnostics',
+              onPressed: _forced ? null : () => _openEngineTab(services),
+              icon: const Icon(Icons.memory_outlined),
+            ),
             IconButton(
               tooltip: 'Check for updates',
               onPressed: _forced ? null : () => unawaited(_manualUpdateCheck()),
@@ -679,6 +831,22 @@ class _HarborHomePageState extends State<HarborHomePage> {
                   ),
                 ],
               ),
+            if (!services.modelRuntime.ready)
+              MaterialBanner(
+                content: Text(
+                  'Harbor has no working model: '
+                  '${services.modelRuntime.error ?? services.modelRuntime.status}. '
+                  'Chat will answer from an untrained network until a corpus is '
+                  'gathered and training succeeds.',
+                ),
+                leading: const Icon(Icons.psychology_outlined),
+                actions: <Widget>[
+                  TextButton(
+                    onPressed: () => setState(() => _tabIndex = 2),
+                    child: const Text('Open Learn'),
+                  ),
+                ],
+              ),
             if (_bootstrapError != null)
               MaterialBanner(
                 content: Text(_bootstrapError!),
@@ -695,7 +863,9 @@ class _HarborHomePageState extends State<HarborHomePage> {
                 index: _tabIndex,
                 children: <Widget>[
                   _WorkspaceTab(services: services),
-                  _EngineTab(services: services),
+                  ChatScreen(controller: services.chat),
+                  _LearnTab(services: services),
+                  ToolsScreen(controller: services.tools),
                   _SettingsTab(services: services),
                 ],
               ),
@@ -714,9 +884,19 @@ class _HarborHomePageState extends State<HarborHomePage> {
               label: 'Workspace',
             ),
             NavigationDestination(
-              icon: Icon(Icons.memory_outlined),
-              selectedIcon: Icon(Icons.memory),
-              label: 'Engine',
+              icon: Icon(Icons.chat_bubble_outline),
+              selectedIcon: Icon(Icons.chat_bubble),
+              label: 'Chat',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.school_outlined),
+              selectedIcon: Icon(Icons.school),
+              label: 'Learn',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.handyman_outlined),
+              selectedIcon: Icon(Icons.handyman),
+              label: 'Tools',
             ),
             NavigationDestination(
               icon: Icon(Icons.settings_outlined),
@@ -726,6 +906,25 @@ class _HarborHomePageState extends State<HarborHomePage> {
           ],
         ),
         bottomSheet: _buildSoftUpdateBanner(services),
+      ),
+    );
+  }
+
+  /// Opens the engine diagnostics on top of the tabs.
+  ///
+  /// It is a route rather than a sixth destination because a `NavigationBar`
+  /// with six items either shrinks the labels until they are unreadable or
+  /// scrolls, and the diagnostics are something you visit deliberately rather
+  /// than live in.
+  void _openEngineTab(HarborServices services) {
+    unawaited(
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (BuildContext context) => Scaffold(
+            appBar: AppBar(title: const Text('Engine diagnostics')),
+            body: _EngineTab(services: services),
+          ),
+        ),
       ),
     );
   }
@@ -755,6 +954,45 @@ class _HarborHomePageState extends State<HarborHomePage> {
           setState(() {});
         }
       },
+    );
+  }
+}
+
+/// Training and the corpus it learns from, as two sub-tabs.
+///
+/// They belong together because the order is not a preference: training reads
+/// whatever the corpus holds, so a learner that cannot find the corpus tab
+/// reports "the corpus is empty" without explaining where to fix it.
+class _LearnTab extends StatelessWidget {
+  const _LearnTab({required this.services});
+
+  final HarborServices services;
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Column(
+        children: <Widget>[
+          const TabBar(
+            tabs: <Widget>[
+              Tab(text: 'Training'),
+              Tab(text: 'Corpus'),
+            ],
+          ),
+          Expanded(
+            child: TabBarView(
+              children: <Widget>[
+                TrainingScreen(
+                  controller: services.training,
+                  runtime: services.modelRuntime,
+                ),
+                CorpusScreen(controller: services.corpus),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -802,6 +1040,11 @@ class DynamicModuleContextBuilder extends StatelessWidget {
             agent: services.agent,
             updateService: services.updateService,
             currentUpdateResult: services.lastUpdateCheck,
+            chat: services.chat,
+            tools: services.tools,
+            training: services.training,
+            corpus: services.corpus,
+            modelRuntime: services.modelRuntime,
           ),
         );
       },

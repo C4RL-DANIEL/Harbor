@@ -14,6 +14,7 @@ import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_static/shelf_static.dart';
 
 import 'package:update_server/src/api_router.dart';
+import 'package:update_server/src/chat_service.dart';
 import 'package:update_server/src/lifecycle.dart';
 import 'package:update_server/src/models.dart';
 import 'package:update_server/src/release_store.dart';
@@ -73,11 +74,29 @@ void main(List<String> arguments) async {
     return;
   }
 
+  // The chat model is prepared with the other stores so the first request does
+  // not pay the tokenizer-training and initialisation cost. A failure here is
+  // logged and survived: the update API must keep serving even when the model
+  // cannot be built, and the chat routes then report the failure themselves.
+  final HarborChatService chatService = HarborChatService();
+  try {
+    await chatService.initialize();
+    final Map<String, Object?> chatStatus = chatService.status();
+    _log(
+      'chat model ready: ${chatStatus['vocabulary']} tokens, '
+      '${chatStatus['parameters']} parameters, '
+      'context ${chatStatus['context_length']}',
+    );
+  } on Object catch (error) {
+    _log('chat model unavailable: $error');
+  }
+
   final Directory? webDirectory = _findWebDirectory();
   final Router router = buildRouter(
     store: store,
     adminToken: adminToken,
     log: _log,
+    chatService: chatService,
   );
   final InFlightTracker tracker = InFlightTracker();
   final Handler handler = const Pipeline()
