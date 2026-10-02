@@ -7,6 +7,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'package:http/http.dart' as http;
 
 import 'package:flutter/material.dart';
 import 'package:harbor_core/harbor_core.dart';
@@ -1783,6 +1784,54 @@ class _ChatPaneState extends State<ChatPane> {
     }
   }
 
+  /// Connects to the server's chat endpoint (SSE) so the admin dashboard
+  /// reflects the same model the endpoint hosts.
+  Stream<ChatEvent> _connectToServer(List<ChatMessage> history) async* {
+    try {
+      final http.Client client = http.Client();
+      final Uri uri = Uri.parse('/api/v1/chat?stream=true');
+      final http.Response response = await client.post(
+        uri,
+        headers: <String, String>{'Content-Type': 'application/json'},
+        body: jsonEncode(<String, Object?>{
+          'messages': history.map((ChatMessage m) => m.toJson()).toList(),
+        }),
+      );
+      if (response.statusCode != 200) {
+        yield ChatFailed('Server returned ${response.statusCode}');
+        return;
+      }
+      final List<String> lines = const LineSplitter().convert(response.body);
+      for (final String line in lines) {
+        if (line.startsWith('data: ')) {
+          final String payload = line.substring(6);
+          if (payload == '[DONE]') {
+            yield ChatFinished('');
+            return;
+          }
+          try {
+            final Map<String, dynamic> event = jsonDecode(payload);
+            final String text = event['choices']?[0]?['delta']?['content']?.toString() ?? '';
+            if (text.isNotEmpty) {
+              yield ChatToken(text);
+            }
+            if (event['finish_reason'] == 'stop') {
+              yield ChatFinished(event['choices'][0]['message']?['content']?.toString() ?? '');
+              return;
+            }
+          } on Object {
+            // Non-JSON lines or unexpected events: ignore.
+          }
+        }
+      }
+      yield ChatFinished('');
+    } on Object catch (e) {
+      yield ChatFailed('Server connection failed: $e');
+    } finally {
+      await _model.dispose(); // Avoid leaking local model when using server
+    }
+  }
+
   /// Starts a turn over the current transcript and streams its events.
   ///
   /// The engine's stream is consumed rather than awaited so every token is
@@ -1790,7 +1839,7 @@ class _ChatPaneState extends State<ChatPane> {
   /// through a messenger captured before any asynchronous work begins.
   void _send() {
     final String text = _composer.text.trim();
-    if (text.isEmpty || _loading || _busy) {
+    if (text.isEmpty || _busy) {
       return;
     }
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
@@ -1803,7 +1852,10 @@ class _ChatPaneState extends State<ChatPane> {
       _error = null;
     });
     _scrollToBottom();
-    _turn = _model.respond(List<ChatMessage>.of(_messages)).listen(
+    // Connect to the server's /api/v1/chat endpoint (SSE stream) instead of
+    // only the local BrowserModel — the dashboard should reflect the same
+    // model the server is hosting.
+    _turn = _connectToServer(List<ChatMessage>.of(_messages)).listen(
       (ChatEvent event) {
         if (!mounted) {
           return;
