@@ -329,6 +329,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         child: SelectableText(
           content,
+          semanticsLabel: 'User message: $content',
           style: TextStyle(color: scheme.onPrimaryContainer),
         ),
       ),
@@ -358,7 +359,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final ColorScheme scheme = Theme.of(context).colorScheme;
     return _assistantShell(
       context,
-      SelectableText(content, style: TextStyle(color: scheme.onSurface)),
+      Semantics(
+        label: 'Assistant message: $content',
+        child: SelectableText(content, style: TextStyle(color: scheme.onSurface)),
+      ),
     );
   }
 
@@ -406,12 +410,15 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                     const SizedBox(width: 6),
                     Flexible(
-                      child: Text(
-                        message.name ?? 'tool',
-                        style: theme.textTheme.labelMedium?.copyWith(
-                          fontFamily: 'monospace',
+                      child: Semantics(
+                        label: 'Tool result: ${message.name ?? 'tool'}',
+                        child: Text(
+                          message.name ?? 'tool',
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            fontFamily: 'monospace',
+                          ),
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                     const SizedBox(width: 8),
