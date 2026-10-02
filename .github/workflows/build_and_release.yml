@@ -65,6 +65,7 @@ jobs:
           fetch-tags: true
 
       - name: Preflight - required application files
+        working-directory: apps/main_app
         shell: bash
         run: |
           set -euo pipefail
