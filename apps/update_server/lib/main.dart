@@ -1789,7 +1789,8 @@ class _ChatPaneState extends State<ChatPane> {
   Stream<ChatEvent> _connectToServer(List<ChatMessage> history) async* {
     try {
       final http.Client client = http.Client();
-      final Uri uri = Uri.parse('/api/v1/chat?stream=true');
+      try {
+        final Uri uri = Uri.parse('/api/v1/chat?stream=true');
       final http.Response response = await client.post(
         uri,
         headers: <String, String>{'Content-Type': 'application/json'},
@@ -1806,7 +1807,7 @@ class _ChatPaneState extends State<ChatPane> {
         if (line.startsWith('data: ')) {
           final String payload = line.substring(6);
           if (payload == '[DONE]') {
-            yield ChatFinished('');
+            yield ChatFinished(text: '', generatedTokens: 0, elapsed: Duration.zero);
             return;
           }
           try {
@@ -1816,7 +1817,8 @@ class _ChatPaneState extends State<ChatPane> {
               yield ChatToken(text);
             }
             if (event['finish_reason'] == 'stop') {
-              yield ChatFinished(event['choices'][0]['message']?['content']?.toString() ?? '');
+              final String finalText = event['choices'][0]['message']?['content']?.toString() ?? '';
+              yield ChatFinished(text: finalText, generatedTokens: finalText.isEmpty ? 0 : 1, elapsed: Duration.zero);
               return;
             }
           } on Object {
@@ -1824,11 +1826,11 @@ class _ChatPaneState extends State<ChatPane> {
           }
         }
       }
-      yield ChatFinished('');
+      yield ChatFinished(text: '', generatedTokens: 0, elapsed: Duration.zero);
     } on Object catch (e) {
       yield ChatFailed('Server connection failed: $e');
     } finally {
-      await _model.dispose(); // Avoid leaking local model when using server
+      client.close();
     }
   }
 
