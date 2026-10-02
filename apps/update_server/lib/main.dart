@@ -300,6 +300,21 @@ class _OverviewPaneState extends State<OverviewPane> {
     );
   }
 
+  Future<void> _toggleForceUpdate(bool value) async {
+    final AdminApiClient? client = widget.client;
+    if (client == null) return;
+    try {
+      await client.adminUpdate(platform: 'android', forceUpdate: value);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Force update ${value ? 'enabled' : 'disabled'}')),
+      );
+    } on Object catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to update force flag: $e')),
+      );
+    }
+  }
+
   void _reload() => setState(() => _future = _load());
 
   @override
@@ -360,9 +375,14 @@ class _OverviewPaneState extends State<OverviewPane> {
                               Text(release.forceUpdate ? 'yes' : 'no'),
                             ),
                             DataCell(Text(_formatBytes(release.sizeBytes))),
+                        ],
                           ]),
                       ],
                     ),
+            ),
+            _Panel(
+              title: 'Admin control',
+              child: Container(padding: EdgeInsets.all(8), child: Text('Toggle force update (requires server endpoint)')),
             ),
             _Panel(
               title: 'Feature flag matrix v${data.flags.version}',
