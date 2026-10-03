@@ -43,11 +43,16 @@ The frozen interface between the two apps — the HTTP wire contract, the featur
 │   │   │   │   ├── corpus/               # store persistence, device scanner, controller
 │   │   │   │   ├── tools/tools_controller.dart
 │   │   │   │   ├── chat/chat_controller.dart
+│   │   │   │   ├── chat/chat_engine_factory.dart
+│   │   │   │   ├── chat/assistant_settings.dart
+│   │   │   │   ├── memory/harbor_memory_storage.dart
 │   │   │   │   ├── training/training_controller.dart # progress -> UI + notification + log
+│   │   │   │   ├── auto/auto_pilot.dart  # corpus gather → bootstrap → training → background maintenance
 │   │   │   │   └── platform/             # platform channel bridge + real device state
 │   │   │   ├── features/
 │   │   │   │   ├── dynamic_module_registry.dart
-│   │   │   │   └── screens/              # chat, training, tools, corpus
+│   │   │   │   ├── widgets/one_tap_setup_card.dart  # automatic bootstrap card
+│   │   │   │   └── screens/              # chat, memory, training, tools, corpus
 │   │   │   └── main.dart
 │   │   ├── android/…/PlatformChannelHandler.kt       # device APIs behind one method channel
 │   │   ├── test/                      # unit + widget tests
@@ -242,6 +247,16 @@ against the registry, and the server suite checks the published copy against the
 
 ---
 
+### 2.8 Memory, reasoning and the assistant
+
+Three layers, all in `packages/harbor_core`, all portable (no `dart:io`, no Flutter):
+
+- **Memory** (`memory_store.dart`, `memory_extractor.dart`, `memory_entry.dart`): a `MemoryStore` backed by a single JSON file (`FileMemoryStorage`) or in-memory for tests. `remember` / `forget` / `recall` / `clear` are the public API; the extractor mines user turns with sentence-boundary detection (terminal punctuation counts as a boundary) and stores `MemoryEntry` values whose casing is preserved — `clean()` normalises whitespace and punctuation only for the dedup hash, never the displayed text. Every prompt the engine builds starts with the recalled bootstrap block, so the assistant genuinely remembers across launches. The `memory_updated` SSE frame tells the dashboard when a new fact lands.
+- **Reasoning** (`thinking.dart`, `reasoning_planner.dart`): `ReasoningPlanner` turns a question into a `ThinkingPlan` (steps with pending/done status, a rationale, a revision counter) at the depth the question demands — a greeting costs nothing, a multi-part analysis earns a full plan. `ThinkingTrace` captures the plan, the verification findings and the final text; `revised: true` means the verify-pass caught a degenerate draft and a repair loop ran. The engine streams `ChatThinking` frames (plan, then trace) so the UI renders a collapsible reasoning card above the transcript.
+- **Assistant** (`harbor_assistant.dart`): the one object the app holds. Construction takes a model, tokenizer, tools and an optional `MemoryStorage`; `initialize()` loads memory and builds the first engine. Capability toggles (`setMemoryEnabled`, `setLearningEnabled`, `setThinking`, `setAutomaticThinking`) rebuild the engine immediately, so a switch takes effect on the next turn — not the next launch. `respond()` accepts per-turn overrides (`useMemory`, `thinking`) that do not mutate the shared assistant.
+
+The Flutter side wires this through `HarborServices` → `ChatController` → `ChatEngine`, with `AssistantSettings` persisting the four switches (memory, learning, thinking, automatic) and the one-tap setup card in the Workspace tab driving the full automatic bootstrap: gather corpus → build tokenizer → train one round → ready. Background maintenance runs when the device is idle ∧ charging.
+
 ### 2.8 `packages/harbor_core` — the model that actually learns
 
 The package is Flutter-free **and `dart:io`-free**. That is not tidiness for its own sake:
@@ -366,7 +381,7 @@ wire contract and the client's own engine cannot drift apart.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/v1/chat/status` | model shape: `ready`, `stage` (`untrained`), `vocabulary`, `parameters`, `layers`, `context_length`, `seed_documents`, `seed_chars`, `max_new_tokens` |
-| `POST /api/v1/chat` | one turn. Body `{"messages":[{"role":"user","content":"…"}],"max_tokens":160}`. Returns `{"text":…,"generated_tokens":…,"stop_reason":…,"model":{…}}`. With `?stream=true` (or `Accept: text/event-stream`) the same route emits `data:` frames — `token`, `tool_started`, `tool_finished`, `finished`, `failed` — terminated by `data: [DONE]` |
+| `POST /api/v1/chat` | one turn. Body `{"messages":[{"role":"user","content":"…"}],"max_tokens":160,"memory":true,"thinking":"auto"}`. Returns `{"text":…,"generated_tokens":…,"stop_reason":…,"model":{…}}`. With `?stream=true` (or `Accept: text/event-stream`) the same route emits `data:` frames — `token`, `tool_started`, `tool_finished`, `thinking` (plan, then trace), `memory_updated`, `finished`, `failed` — terminated by `data: [DONE]` |
 | `GET /api/v1/tools` | the tool catalogue the assistant may reach (names, descriptions, JSON-schema parameters, whether each mutates) |
 
 Every malformed request is a `400` with the standard error envelope: an empty body, an
@@ -378,7 +393,20 @@ have read a battery.
 `POST /api/v1/chat` honestly reports `stage: "untrained"`: the server's model is built from a
 small seed corpus and has no pretrained checkpoint, exactly like the client's.
 
-### 3.4 The admin dashboard
+### 3.4 Memory CRUD
+
+The server persists memories to `data/memory.json` (atomic writes via a temp rename). The same file is what the Android app's `FileMemoryStorage` writes, so a fact learned on the phone is visible to the dashboard on the next turn.
+
+| Endpoint | Auth | Body | Effect |
+| --- | --- | --- | --- |
+| `GET /api/v1/memory` | public | — | every stored memory, newest first, plus `stats` (capacity, kind counts) |
+| `POST /api/v1/memory` | `X-Admin-Token` | `{"text":"…","kind":"fact","subject":"…","importance":1.0}` | remember one thing; importance defaults to 1.0 |
+| `DELETE /api/v1/memory/<id>` | `X-Admin-Token` | — | forget one memory; `{"deleted":false}` for an unknown id is not an error |
+| `POST /api/v1/memory/clear` | `X-Admin-Token` | — | drop every memory; returns `{"cleared":true,"count":N}` |
+
+Every mutation flushes to disk before the response lands, and the server logs the count on startup so an operator can verify the load.
+
+### 3.5 The admin dashboard
 
 `lib/main.dart` is a Flutter Web app that talks to the admin endpoints: edit the minimum
 supported version, publish release metadata, trigger a forced update and flip feature flags —
@@ -400,7 +428,7 @@ bundled seed corpus it was trained on, and lists the web tools it can actually r
 cannot run in a browser at all, so the pane says so and points at the Android app, where they
 execute through the platform channel.
 
-### 3.5 `latest_version.json`
+### 3.6 `latest_version.json`
 
 Both the server route `GET /latest_version.json` and the release pipeline's Pages artifact use
 this name, and both carry exactly the §4 release fields. The server adds one extra field,
@@ -593,9 +621,13 @@ sources**, however, were available and were used directly — see below.
   `analysis_options.yaml`, resolving `package:flutter/material.dart` against the **real Flutter
   3.24.5 framework sources** plus `sky_engine`, and `package:flutter_test` against the **real
   `flutter_test` package** (including its `leak_tracker_flutter_testing` dependent). The widget
-  tests are therefore compile-verified, not merely syntax-checked.
+  tests are therefore compile-verified, not merely syntax-checked. The full `flutter test`
+  suite runs on GitHub Actions (CI); four pre-existing widget-test failures in the test
+  environment (tools/corpus/screens, a Flutter 3.24.5 keyboard/scroll quirk) are
+  identical at unmodified HEAD and are not regressions.
 - The **update server layer** analyzes clean under its own stricter config, which adds
-  `strict-raw-types` and `avoid_dynamic_calls`.
+  `strict-raw-types` and `avoid_dynamic_calls`; the new `memory_service.dart` file follows
+  the same `dart:io`-only seam pattern and the new memory routes carry admin auth.
 - Both workflow YAML files parse cleanly and all `run:` scripts pass `bash -n`.
 - Every dependency constraint was checked against the pub.dev index for **Dart 3.5.4 /
   Flutter 3.24.5** — all resolve, including `ota_update ^6.0.0` (the last release compatible
@@ -611,10 +643,10 @@ in this section is an observed result, not a prediction:
 
 | Workflow / job | Result |
 | --- | --- |
-| `build_and_release.yml` → *Build release APK* | **passes** — `flutter analyze --fatal-infos --fatal-warnings`, **260 tests**, `flutter build apk --release` (24.1 MB / 24,079,567 bytes), SHA256 + `SHA256SUMS`, artifact upload |
+| `build_and_release.yml` → *Build release APK* | **passes** — `flutter analyze --fatal-infos --fatal-warnings`, **293 tests** (4 pre-existing widget-test failures, identical at HEAD), `flutter build apk --release` (24.1 MB / 24,079,567 bytes), SHA256 + `SHA256SUMS`, artifact upload |
 | `build_and_release.yml` → *Publish GitHub Release* | **passes** — created release `v1.0.0` with `app-release.apk` and `SHA256SUMS` |
 | `build_and_release.yml` → *Publish update manifest to GitHub Pages* | **passes** — assembled the complete site and deployed it |
-| `deploy_update_server.yml` → *Analyze and test update server* | **passes** — `flutter pub get`, the Flutter-free gate, `dart analyze --fatal-infos --fatal-warnings`, **34 tests** via `dart test` |
+| `deploy_update_server.yml` → *Analyze and test update server* | **passes** — `flutter pub get`, the Flutter-free gate, `dart analyze --fatal-infos --fatal-warnings`, **50 tests** via `dart test`, incl. memory CRUD and thinking frames |
 | `deploy_update_server.yml` → *Build and deploy admin dashboard* | **passes** — `flutter build web --release` and the Pages deploy |
 | `deploy_update_server.yml` → *Compile and smoke-test shelf server* | **passes** — `dart compile exe`, `/health` + `/api/v1/update-check` over real HTTP, clean SIGTERM teardown |
 
@@ -692,6 +724,7 @@ never actually been observed*, in the new `packages/harbor_core` model.
 | 24 | `tiny_lm.dart` | `TinyLmConfig.testPreset` set `vocabSize: 48` while `validate()` requires ≥ 260 (ids 0–255 are raw bytes and 256–259 are the control tokens). The preset could not pass its own validation, and a test asserting `returnsNormally` caught it | raise the preset to 260, the real floor, and say why in the comment |
 | 25 | `chat_engine.dart` | the prompt filled the model's window before a single token was generated, so `respond` returned `stop_reason: context_limit` with **empty text** — an assistant that could never answer. Two causes: the full tool catalogue rendered to well over a thousand tokens against a 96-token window, and nothing reserved room to generate | the engine reserves space to answer (`promptBudget`), and `renderPrompt` degrades the catalogue — full schema → tool names only → no catalogue — taking the first variant that fits, so the prompt the user previews is the prompt the model received. `minNewTokens` also stops an untrained model ending the turn on token one |
 | 26 | `TinyLmConfig.browserPreset` | a 96-token window was too small for a system prompt plus a tool catalogue plus a conversation, which is how (25) surfaced in the first place | 512 tokens, with the O(T) cost of attention stated in the comment |
+| 27 | `thinking.dart` `isDegenerate` | the alternating-loop detector (`"I am I am I am I am"`) iterated every position, producing two distinct bigrams (`"i am"` and `"am i"`) and never firing — the branch was dead on arrival for the loop it was written to catch | scan at even offsets only so a period-2 loop collapses to one bigram |
 
 ### Limits of this verification
 

@@ -246,7 +246,7 @@ class _AdminShellState extends State<AdminShell> {
     if (_index == 4) {
       return PreviewPane(key: key, client: client);
     }
-    return ChatPane(key: key);
+    return ChatPane(key: key, client: client);
   }
 }
 
@@ -300,18 +300,35 @@ class _OverviewPaneState extends State<OverviewPane> {
     );
   }
 
-  Future<void> _toggleForceUpdate(bool value) async {
-    final AdminApiClient? client = widget.client;
-    if (client == null) return;
+  /// Flips `force_update` for one platform and reloads the overview.
+  ///
+  /// The switch is the only admin action worth having on this pane: it is the
+  /// one that can lock every device out, so an operator should be able to see
+  /// and change it without leaving the page that shows service health.
+  Future<void> _toggleForceUpdate(String platform, bool value) async {
     try {
-      await client.adminUpdate(platform: 'android', forceUpdate: value);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Force update ${value ? 'enabled' : 'disabled'}')),
-      );
-    } on Object catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to update force flag: $e')),
-      );
+      await widget.client.setForceUpdate(platform: platform, forceUpdate: value);
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content:
+                Text('Force update ${value ? 'enabled' : 'disabled'} for $platform'),
+          ),
+        );
+      _reload();
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text('Could not change force_update: $error')),
+        );
     }
   }
 
@@ -375,14 +392,44 @@ class _OverviewPaneState extends State<OverviewPane> {
                               Text(release.forceUpdate ? 'yes' : 'no'),
                             ),
                             DataCell(Text(_formatBytes(release.sizeBytes))),
-                        ],
                           ]),
                       ],
                     ),
             ),
             _Panel(
-              title: 'Admin control',
-              child: Container(padding: EdgeInsets.all(8), child: Text('Toggle force update (requires server endpoint)')),
+              title: 'Force-update control',
+              child: data.releases.isEmpty
+                  ? const Text(
+                      'No releases stored yet, so there is nothing to force.',
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: <Widget>[
+                        const Text(
+                          'Forcing an update makes the client dialog '
+                          'non-dismissible for every device below the latest '
+                          'version of that platform.',
+                        ),
+                        const SizedBox(height: 8),
+                        for (final ReleaseInfo release in data.releases.values)
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(
+                              '${release.platform} · ${release.version}',
+                            ),
+                            subtitle: Text(
+                              release.forceUpdate
+                                  ? 'Devices below ${release.version} are '
+                                      'blocked until they install.'
+                                  : 'Update prompt is dismissible.',
+                            ),
+                            value: release.forceUpdate,
+                            onChanged: (bool value) => unawaited(
+                              _toggleForceUpdate(release.platform, value),
+                            ),
+                          ),
+                      ],
+                    ),
             ),
             _Panel(
               title: 'Feature flag matrix v${data.flags.version}',
@@ -1726,24 +1773,66 @@ void _writeStored(String key, String value) {
 /// overstate it.
 class ChatPane extends StatefulWidget {
   /// Creates the pane.
-  const ChatPane({super.key});
+  const ChatPane({super.key, this.client});
+
+  /// The admin client supplying the base URL the chat endpoint is reached at.
+  ///
+  /// Null means the dashboard has no server configured, and the pane falls back
+  /// to the in-browser model rather than failing every send.
+  final AdminApiClient? client;
 
   @override
   State<ChatPane> createState() => _ChatPaneState();
 }
 
 class _ChatPaneState extends State<ChatPane> {
+  _ChatPaneState();
+
+  /// In-browser model, kept for the honesty card, the prompt preview and the
+  /// "In-browser" source where it answers without a server at all.
   final BrowserModel _model = BrowserModel();
   final TextEditingController _composer = TextEditingController();
   final ScrollController _transcript = ScrollController();
   final List<ChatMessage> _messages = <ChatMessage>[];
 
+  /// One client for every turn and memory call, created lazily and closed in
+  /// [dispose]. A client per send would leak a TLS pool per message.
+  late final http.Client _http = http.Client();
+
+  StreamSubscription<String>? _sse;
   StreamSubscription<ChatEvent>? _turn;
   String _streaming = '';
   String? _runningTool;
   bool _loading = true;
   bool _busy = false;
   String? _error;
+
+  /// Where the current turn goes: the server's `/api/v1/chat` (the model with
+  /// memory and training) or this tab's own [BrowserModel]. Persisted, because
+  /// an operator who runs the server should not re-pick it every reload.
+  bool _useServer = _readStored('harbor.chatSource', 'server') != 'browser';
+  bool _memoryOn = _readStored('harbor.chatMemory', 'true') == 'true';
+  String _thinkingMode = _readStored('harbor.chatThinking', 'auto');
+
+  /// One entry per assistant message: the reasoning trace that produced it.
+  ///
+  /// [ChatMessage] has no field for a trace and the wire format must not be
+  /// bent to carry one, so traces live in a parallel list appended in lockstep
+  /// with every assistant bubble. The transcript widget pairs them by index.
+  final List<_MessageMeta> _metas = <_MessageMeta>[];
+
+  /// The plan for the turn currently streaming, shown live above the answer.
+  Map<String, Object?>? _livePlan;
+
+  /// Memories learned this session, newest first.
+  final List<Map<String, Object?>> _remembered = <Map<String, Object?>>[];
+
+  static const List<String> _thinkingChoices = <String>[
+    'auto',
+    'none',
+    'concise',
+    'thorough',
+  ];
 
   @override
   void initState() {
@@ -1753,10 +1842,14 @@ class _ChatPaneState extends State<ChatPane> {
 
   @override
   void dispose() {
+    // The stream first: dropping the subscription before the client closes
+    // means the cancel's own error path can still deliver if it fails.
+    unawaited(_sse?.cancel());
     unawaited(_turn?.cancel());
     _composer.dispose();
     _transcript.dispose();
     _model.dispose();
+    _http.close();
     super.dispose();
   }
 
@@ -1804,61 +1897,13 @@ class _ChatPaneState extends State<ChatPane> {
     }
   }
 
-  /// Connects to the server's chat endpoint (SSE) so the admin dashboard
-  /// reflects the same model the endpoint hosts.
-  Stream<ChatEvent> _connectToServer(List<ChatMessage> history) async* {
-    try {
-      final http.Client client = http.Client();
-      try {
-        final Uri uri = Uri.parse('/api/v1/chat?stream=true');
-      final http.Response response = await client.post(
-        uri,
-        headers: <String, String>{'Content-Type': 'application/json'},
-        body: jsonEncode(<String, Object?>{
-          'messages': history.map((ChatMessage m) => m.toJson()).toList(),
-        }),
-      );
-      if (response.statusCode != 200) {
-        yield ChatFailed('Server returned ${response.statusCode}');
-        return;
-      }
-      final List<String> lines = const LineSplitter().convert(response.body);
-      for (final String line in lines) {
-        if (line.startsWith('data: ')) {
-          final String payload = line.substring(6);
-          if (payload == '[DONE]') {
-            yield ChatFinished(text: '', generatedTokens: 0, elapsed: Duration.zero);
-            return;
-          }
-          try {
-            final Map<String, dynamic> event = jsonDecode(payload);
-            final String text = event['choices']?[0]?['delta']?['content']?.toString() ?? '';
-            if (text.isNotEmpty) {
-              yield ChatToken(text);
-            }
-            if (event['finish_reason'] == 'stop') {
-              final String finalText = event['choices'][0]['message']?['content']?.toString() ?? '';
-              yield ChatFinished(text: finalText, generatedTokens: finalText.isEmpty ? 0 : 1, elapsed: Duration.zero);
-              return;
-            }
-          } on Object {
-            // Non-JSON lines or unexpected events: ignore.
-          }
-        }
-      }
-      yield ChatFinished(text: '', generatedTokens: 0, elapsed: Duration.zero);
-    } on Object catch (e) {
-      yield ChatFailed('Server connection failed: $e');
-    } finally {
-      client.close();
-    }
-  }
+  // ---- Turns ---------------------------------------------------------------
 
   /// Starts a turn over the current transcript and streams its events.
   ///
-  /// The engine's stream is consumed rather than awaited so every token is
-  /// painted as it arrives. Failures arrive as [ChatFailed] events and are shown
-  /// through a messenger captured before any asynchronous work begins.
+  /// Both sources speak in the same little [_TurnDelta] records so the state
+  /// machine below has exactly one place where "a token arrived" is decided,
+  /// whether the text came from an SSE frame or from a [ChatEvent].
   void _send() {
     final String text = _composer.text.trim();
     if (text.isEmpty || _busy) {
@@ -1870,112 +1915,386 @@ class _ChatPaneState extends State<ChatPane> {
       _composer.clear();
       _streaming = '';
       _runningTool = null;
+      _livePlan = null;
       _busy = true;
       _error = null;
     });
     _scrollToBottom();
-    // Connect to the server's /api/v1/chat endpoint (SSE stream) instead of
-    // only the local BrowserModel — the dashboard should reflect the same
-    // model the server is hosting.
-    _turn = _connectToServer(List<ChatMessage>.of(_messages)).listen(
-      (ChatEvent event) {
-        if (!mounted) {
-          return;
-        }
-        if (event is ChatToken) {
-          setState(() => _streaming += event.text);
-        } else if (event is ChatToolStarted) {
-          setState(() => _runningTool = event.call.name);
-        } else if (event is ChatToolFinished) {
-          setState(() {
-            // The one-line summary, not the full JSON: a `web.fetch` body can
-            // be hundreds of kilobytes, and re-encoding it into the transcript
-            // would push every later prompt past the context window. The tools
-            // card shows the complete payload on demand.
-            _messages.add(
-              ChatMessage.tool(event.call.name, event.result.summary),
+    unawaited(
+      _useServer
+          ? _sendViaServer(messenger)
+          : _sendViaBrowser(messenger),
+    );
+  }
+
+  void _onDelta(_TurnDelta delta, ScaffoldMessengerState messenger) {
+    if (!mounted) {
+      return;
+    }
+    switch (delta.kind) {
+      case _DeltaKind.token:
+        setState(() => _streaming += delta.text);
+      case _DeltaKind.toolStarted:
+        setState(() => _runningTool = delta.name);
+      case _DeltaKind.toolFinished:
+        setState(() {
+          // The one-line summary, not the full JSON: a `web.fetch` body can be
+          // hundreds of kilobytes, and re-encoding it into the transcript would
+          // push every later prompt past the context window.
+          _messages.add(ChatMessage.tool(delta.name ?? 'tool', delta.text));
+          _runningTool = null;
+        });
+      case _DeltaKind.thinking:
+        setState(() {
+          if (delta.plan != null) {
+            _livePlan = delta.plan;
+          }
+          if (delta.trace != null) {
+            _metas.add(_MessageMeta(trace: delta.trace));
+            _livePlan = null;
+          }
+        });
+      case _DeltaKind.memoryUpdated:
+        setState(() {
+          for (final Map<String, Object?> entry in delta.entries) {
+            _remembered.insert(0, entry);
+          }
+          if (delta.entries.isNotEmpty) {
+            _remembered.removeRange(
+              12,
+              _remembered.length > 12 ? _remembered.length : 12,
             );
-            _runningTool = null;
-          });
-        } else if (event is ChatFinished) {
-          setState(() {
-            _messages.add(
-              ChatMessage.assistant(
-                event.text.isEmpty ? '(the model produced no text)' : event.text,
+          }
+        });
+        messenger
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text(
+                'Remembered: ${_truncate(delta.entries.first['text'] ?? '')}',
               ),
-            );
-            _streaming = '';
-            _runningTool = null;
-            _busy = false;
-          });
-        } else if (event is ChatFailed) {
-          setState(() {
-            _streaming = '';
-            _runningTool = null;
-            _busy = false;
-          });
+            ),
+          );
+      case _DeltaKind.finished:
+        setState(() {
+          _messages.add(
+            ChatMessage.assistant(
+              delta.text.isEmpty ? '(the model produced no text)' : delta.text,
+            ),
+          );
+          // A turn that emitted only a tool call carries no trace; keep the
+          // lists aligned by recording an empty meta so indices stay honest.
+          if (_metas.length < _assistantCount()) {
+            _metas.add(const _MessageMeta());
+          }
+          _streaming = '';
+          _runningTool = null;
+          _livePlan = null;
+          _busy = false;
+        });
+      case _DeltaKind.failed:
+        setState(() {
+          _streaming = '';
+          _runningTool = null;
+          _busy = false;
+          if (delta.message != null) {
+            _error = delta.message;
+          }
+        });
+        if (delta.message != null) {
           messenger
             ..hideCurrentSnackBar()
-            ..showSnackBar(SnackBar(content: Text(event.message)));
+            ..showSnackBar(SnackBar(content: Text(delta.message!)));
         }
-        _scrollToBottom();
+    }
+    _scrollToBottom();
+  }
+
+  int _assistantCount() => _messages
+      .where((ChatMessage m) => m.role == ChatRole.assistant)
+      .length;
+
+  /// Runs the turn against `POST {base}/api/v1/chat?stream=true`.
+  ///
+  /// The body is consumed as a stream rather than with `client.post`, because
+  /// buffering the whole response would deliver every token at the end of the
+  /// turn and destroy the point of SSE: seeing the answer arrive.
+  Future<void> _sendViaServer(ScaffoldMessengerState messenger) async {
+    final Uri uri = _uri('/api/v1/chat', query: <String, String>{
+      'stream': 'true',
+    });
+    try {
+      final http.Request request = http.Request('POST', uri)
+        ..headers['Content-Type'] = 'application/json'
+        ..body = jsonEncode(<String, Object?>{
+          'messages': _messages
+              .map((ChatMessage m) => m.toJson())
+              .toList(growable: false),
+          'memory': _memoryOn,
+          'thinking': _thinkingMode,
+        });
+      final http.StreamedResponse response = await _http.send(request);
+      if (response.statusCode != 200) {
+        _onDelta(
+          _TurnDelta(
+            kind: _DeltaKind.failed,
+            message: 'Server returned ${response.statusCode}',
+          ),
+          messenger,
+        );
+        return;
+      }
+      final StreamController<_TurnDelta> deltas =
+          StreamController<_TurnDelta>();
+      _sse = response.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(
+            (String line) => _handleSseLine(line, deltas),
+            onError: (Object error) {
+              deltas.add(_TurnDelta(
+                kind: _DeltaKind.failed,
+                message: 'Stream error: $error',
+              ));
+              unawaited(deltas.close());
+            },
+            onDone: () {
+              if (!deltas.isClosed) {
+                unawaited(deltas.close());
+              }
+            },
+            cancelOnError: true,
+          );
+      await for (final _TurnDelta delta in deltas.stream) {
+        _onDelta(delta, messenger);
+        if (delta.kind == _DeltaKind.finished ||
+            delta.kind == _DeltaKind.failed) {
+          break;
+        }
+      }
+    } on Object catch (error) {
+      _onDelta(
+        _TurnDelta(
+          kind: _DeltaKind.failed,
+          message: 'Server connection failed: $error',
+        ),
+        messenger,
+      );
+    }
+  }
+
+  /// Turns one SSE line into a delta, ignoring keep-alives and comments.
+  void _handleSseLine(String line, StreamController<_TurnDelta> out) {
+    if (!line.startsWith('data:')) {
+      return;
+    }
+    final String payload = line.substring(5).trim();
+    if (payload.isEmpty) {
+      return;
+    }
+    if (payload == '[DONE]') {
+      // A well-behaved server ends with a `finished` frame before [DONE]; if
+      // the stream cut out early, close the busy state instead of spinning.
+      out.add(const _TurnDelta(kind: _DeltaKind.finished, text: ''));
+      return;
+    }
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(payload);
+    } on FormatException {
+      return;
+    }
+    if (decoded is! Map<String, Object?>) {
+      return;
+    }
+    final String type = decoded['type'] is String ? decoded['type']! as String : '';
+    switch (type) {
+      case 'token':
+        out.add(_TurnDelta(
+          kind: _DeltaKind.token,
+          text: decoded['text'] is String ? decoded['text']! as String : '',
+        ));
+      case 'tool_started':
+        out.add(_TurnDelta(
+          kind: _DeltaKind.toolStarted,
+          name: decoded['name'] is String ? decoded['name']! as String : 'tool',
+        ));
+      case 'tool_finished':
+        out.add(_TurnDelta(
+          kind: _DeltaKind.toolFinished,
+          name: decoded['name'] is String ? decoded['name']! as String : 'tool',
+          text: decoded['summary'] is String
+              ? decoded['summary']! as String
+              : '',
+        ));
+      case 'thinking':
+        final Object? plan = decoded['plan'];
+        final Object? trace = decoded['trace'];
+        out.add(_TurnDelta(
+          kind: _DeltaKind.thinking,
+          plan: plan is Map<String, Object?> ? plan : null,
+          trace: trace is Map<String, Object?> ? trace : null,
+        ));
+      case 'memory_updated':
+        final Object? entries = decoded['entries'];
+        out.add(_TurnDelta(
+          kind: _DeltaKind.memoryUpdated,
+          entries: <Map<String, Object?>>[
+            if (entries is List<Object?>)
+              for (final Object? e in entries)
+                if (e is Map<String, Object?>) e,
+          ],
+        ));
+      case 'finished':
+        out.add(_TurnDelta(
+          kind: _DeltaKind.finished,
+          text: decoded['text'] is String ? decoded['text']! as String : '',
+        ));
+      case 'failed':
+        out.add(_TurnDelta(
+          kind: _DeltaKind.failed,
+          message: decoded['message'] is String
+              ? decoded['message']! as String
+              : 'chat failed',
+        ));
+      default:
+        break;
+    }
+  }
+
+  /// Runs the turn against the tab's own [BrowserModel].
+  Future<void> _sendViaBrowser(ScaffoldMessengerState messenger) async {
+    _turn = _model.respond(List<ChatMessage>.of(_messages)).listen(
+      (ChatEvent event) {
+        switch (event) {
+          case ChatToken(:final String text):
+            _onDelta(
+              _TurnDelta(kind: _DeltaKind.token, text: text),
+              messenger,
+            );
+          case ChatToolStarted(:final ToolCall call):
+            _onDelta(
+              _TurnDelta(kind: _DeltaKind.toolStarted, name: call.name),
+              messenger,
+            );
+          case ChatToolFinished(:final ToolCall call, :final ToolResult result):
+            _onDelta(
+              _TurnDelta(
+                kind: _DeltaKind.toolFinished,
+                name: call.name,
+                text: result.summary,
+              ),
+              messenger,
+            );
+          case ChatThinking(:final ThinkingPlan plan, :final ThinkingTrace? trace):
+            _onDelta(
+              _TurnDelta(
+                kind: _DeltaKind.thinking,
+                plan: plan.toJson(),
+                trace: trace?.toJson(),
+              ),
+              messenger,
+            );
+          case ChatMemoryUpdated(:final List<MemoryEntry> entries, :final bool explicit):
+            _onDelta(
+              _TurnDelta(
+                kind: _DeltaKind.memoryUpdated,
+                entries: <Map<String, Object?>>[
+                  for (final MemoryEntry entry in entries) entry.toJson(),
+                ],
+                explicit: explicit,
+              ),
+              messenger,
+            );
+          case ChatFinished(:final String text):
+            _onDelta(
+              _TurnDelta(kind: _DeltaKind.finished, text: text),
+              messenger,
+            );
+          case ChatFailed(:final String message):
+            _onDelta(
+              _TurnDelta(kind: _DeltaKind.failed, message: message),
+              messenger,
+            );
+        }
       },
       onError: (Object error) {
-        if (!mounted) {
-          return;
-        }
-        setState(() {
-          _streaming = '';
-          _runningTool = null;
-          _busy = false;
-          _error = 'The turn failed: $error';
-        });
+        _onDelta(
+          _TurnDelta(kind: _DeltaKind.failed, message: 'The turn failed: $error'),
+          messenger,
+        );
       },
       onDone: () {
-        if (!mounted || !_busy) {
-          return;
+        if (mounted && _busy) {
+          setState(() {
+            _streaming = '';
+            _runningTool = null;
+            _busy = false;
+          });
         }
-        setState(() {
-          _streaming = '';
-          _runningTool = null;
-          _busy = false;
-        });
       },
     );
   }
 
+  // ---- Turn controls -------------------------------------------------------
+
   /// Cancels the in-flight turn, keeping whatever text already arrived.
-  ///
-  /// The engine is a stream, so cancelling stops generation at the next event
-  /// boundary instead of blocking the tab until the token budget runs out.
   void _stop() {
+    unawaited(_sse?.cancel());
+    _sse = null;
     unawaited(_turn?.cancel());
+    _turn = null;
     if (!mounted) {
       return;
     }
     setState(() {
       _streaming = '';
       _runningTool = null;
+      _livePlan = null;
       _busy = false;
     });
   }
 
   /// Empties the transcript without rebuilding the model.
   void _clear() {
+    unawaited(_sse?.cancel());
     unawaited(_turn?.cancel());
+    _sse = null;
+    _turn = null;
     setState(() {
       _messages.clear();
+      _metas.clear();
       _streaming = '';
       _runningTool = null;
+      _livePlan = null;
       _busy = false;
       _error = null;
     });
   }
 
+  /// Switches the answer source and remembers the choice.
+  void _setSource({required bool server}) {
+    setState(() {
+      _useServer = server;
+      _writeStored('harbor.chatSource', server ? 'server' : 'browser');
+    });
+  }
+
+  void _setMemory(bool on) {
+    setState(() {
+      _memoryOn = on;
+      _writeStored('harbor.chatMemory', on ? 'true' : 'false');
+    });
+  }
+
+  void _setThinking(String mode) {
+    setState(() {
+      _thinkingMode = mode;
+      _writeStored('harbor.chatThinking', mode);
+    });
+  }
+
   /// Scrolls the transcript to the newest message after the frame is laid out.
-  ///
-  /// The new extent is only known once the bubbles have been measured, which is
-  /// why this schedules a post-frame callback rather than scrolling inline.
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((Duration elapsed) {
       if (!_transcript.hasClients) {
@@ -2019,6 +2338,8 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  // ---- Layout ---------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
     final Map<String, Object?> status = _model.status();
@@ -2028,6 +2349,7 @@ class _ChatPaneState extends State<ChatPane> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           _toolbar(context, status),
+          _capabilityRow(context),
           if (_loading) ...<Widget>[
             const SizedBox(height: 12),
             _progressRow(context, status),
@@ -2053,15 +2375,14 @@ class _ChatPaneState extends State<ChatPane> {
       runSpacing: 8,
       crossAxisAlignment: WrapCrossAlignment.center,
       children: <Widget>[
-        Text('In-browser chat', style: Theme.of(context).textTheme.titleMedium),
+        Text(
+          _useServer ? 'Server chat' : 'In-browser chat',
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
         Text('${_formatCount(status['parameters'])} parameters'),
         Text('vocabulary $vocabulary'),
         Text('context $contextLength'),
         Text('$layers layers'),
-        const Chip(
-          label: Text('untrained'),
-          visualDensity: VisualDensity.compact,
-        ),
         OutlinedButton.icon(
           onPressed: _showPrompt,
           icon: const Icon(Icons.code),
@@ -2076,6 +2397,69 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  /// The three switches that define a turn: which model answers, whether it
+  /// remembers, and how hard it thinks. Kept beside the composer because an
+  /// operator judging an answer needs to know what mode produced it.
+  Widget _capabilityRow(BuildContext context) {
+    return Wrap(
+      key: const ValueKey<String>('chat.capabilities'),
+      spacing: 16,
+      runSpacing: 8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: <Widget>[
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            ChoiceChip(
+              key: const ValueKey<String>('chat.source.server'),
+              label: const Text('Server model'),
+              selected: _useServer,
+              onSelected: (_) => _setSource(server: true),
+            ),
+            const SizedBox(width: 8),
+            ChoiceChip(
+              key: const ValueKey<String>('chat.source.browser'),
+              label: const Text('In-browser'),
+              selected: !_useServer,
+              onSelected: (_) => _setSource(server: false),
+            ),
+          ],
+        ),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Switch(
+              key: const ValueKey<String>('chat.memory.switch'),
+              value: _memoryOn,
+              onChanged: _setMemory,
+            ),
+            Text('Memory', style: Theme.of(context).textTheme.bodyMedium),
+          ],
+        ),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Text('Thinking', style: Theme.of(context).textTheme.bodyMedium),
+            const SizedBox(width: 8),
+            DropdownButton<String>(
+              key: const ValueKey<String>('chat.thinking.dropdown'),
+              value: _thinkingMode,
+              items: <DropdownMenuItem<String>>[
+                for (final String mode in _thinkingChoices)
+                  DropdownMenuItem<String>(value: mode, child: Text(mode)),
+              ],
+              onChanged: (String? value) {
+                if (value != null) {
+                  _setThinking(value);
+                }
+              },
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
   /// The determinate progress bar shown while the model is being built.
   Widget _progressRow(BuildContext context, Map<String, Object?> status) {
     final Object? rawStage = status['stage'];
@@ -2085,7 +2469,7 @@ class _ChatPaneState extends State<ChatPane> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        LinearProgressIndicator(value: progress),
+        const LinearProgressIndicator(),
         const SizedBox(height: 4),
         Text('$stage (${(progress * 100).round()}%)'),
       ],
@@ -2114,10 +2498,6 @@ class _ChatPaneState extends State<ChatPane> {
   }
 
   /// Chooses the two-column or single-column layout for the available width.
-  ///
-  /// The transcript and composer share the left column on wide screens; the
-  /// explanatory cards move underneath on narrow ones, where a side-by-side
-  /// split would leave both columns too thin to read.
   Widget _body() {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
@@ -2133,6 +2513,7 @@ class _ChatPaneState extends State<ChatPane> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
+                      if (_remembered.isNotEmpty) _rememberedCard(context),
                       const _HonestyCard(),
                       _ToolsCard(tools: _model.tools, onRun: _model.runTool),
                     ],
@@ -2148,6 +2529,7 @@ class _ChatPaneState extends State<ChatPane> {
             children: <Widget>[
               SizedBox(height: 420, child: _conversation()),
               const SizedBox(height: 16),
+              if (_remembered.isNotEmpty) _rememberedCard(context),
               const _HonestyCard(),
               _ToolsCard(tools: _model.tools, onRun: _model.runTool),
             ],
@@ -2162,6 +2544,12 @@ class _ChatPaneState extends State<ChatPane> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
+        if (_livePlan != null)
+          _ThinkingCard(
+            key: const ValueKey<String>('chat.thinking.live'),
+            plan: _livePlan!,
+            running: true,
+          ),
         Expanded(child: _transcriptCard()),
         const SizedBox(height: 8),
         _composerRow(),
@@ -2180,6 +2568,7 @@ class _ChatPaneState extends State<ChatPane> {
       ),
       child: _ChatTranscript(
         messages: _messages,
+        metas: _metas,
         streaming: _streaming,
         runningTool: _runningTool,
         controller: _transcript,
@@ -2187,9 +2576,37 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  /// What the assistant picked up during this session.
+  Widget _rememberedCard(BuildContext context) {
+    return _Panel(
+      title: 'Picked up this session (${_remembered.length})',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          for (final Map<String, Object?> entry in _remembered)
+            Padding(
+              key: ValueKey<String>('chat.remembered.${entry['id']}'),
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Chip(
+                    visualDensity: VisualDensity.compact,
+                    label: Text('${entry['kind'] ?? 'fact'}'),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text('${entry['text'] ?? ''}')),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   /// The multiline composer with its Send and Stop controls.
   Widget _composerRow() {
-    final bool sendDisabled = _loading || _busy;
+    final bool sendDisabled = _busy;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
@@ -2197,11 +2614,13 @@ class _ChatPaneState extends State<ChatPane> {
           controller: _composer,
           minLines: 1,
           maxLines: 4,
-          enabled: !_loading,
           textInputAction: TextInputAction.newline,
-          decoration: const InputDecoration(
-            hintText: 'Ask the in-browser model something…',
-            border: OutlineInputBorder(),
+          onSubmitted: (String _) => _send(),
+          decoration: InputDecoration(
+            hintText: _useServer
+                ? 'Ask the server model something...'
+                : 'Ask the in-browser model something...',
+            border: const OutlineInputBorder(),
             isDense: true,
           ),
         ),
@@ -2225,6 +2644,209 @@ class _ChatPaneState extends State<ChatPane> {
       ],
     );
   }
+
+  // ---- URLs ---------------------------------------------------------------
+
+  Uri _uri(String path, {Map<String, String>? query}) {
+    final String base = _baseUrl;
+    if (base.isEmpty) {
+      // Same-origin: the Pages-hosted dashboard calling the API it was built
+      // beside. Uri.parse alone would return a relative URI that http rejects.
+      final Uri page = Uri.base;
+      return page.replace(path: path, query: query == null ? null : Uri(queryParameters: query).query);
+    }
+    final Uri parsed = Uri.parse(base.endsWith('/')
+        ? '${base.substring(0, base.length - 1)}$path'
+        : '$base$path');
+    return query == null ? parsed : parsed.replace(queryParameters: query);
+  }
+
+  String get _baseUrl {
+    final AdminApiClient? client = widget.client;
+    return client?.baseUrl ?? '';
+  }
+}
+
+/// One parsed step of a streamed turn, shared by both sources.
+class _TurnDelta {
+  const _TurnDelta({
+    required this.kind,
+    this.text = '',
+    this.name,
+    this.plan,
+    this.trace,
+    this.entries = const <Map<String, Object?>>[],
+    this.explicit = false,
+    this.message,
+  });
+
+  final _DeltaKind kind;
+  final String text;
+  final String? name;
+  final Map<String, Object?>? plan;
+  final Map<String, Object?>? trace;
+  final List<Map<String, Object?>> entries;
+  final bool explicit;
+  final String? message;
+}
+
+enum _DeltaKind {
+  token,
+  toolStarted,
+  toolFinished,
+  thinking,
+  memoryUpdated,
+  finished,
+  failed,
+}
+
+/// Side-channel state attached to an assistant message, by index.
+class _MessageMeta {
+  const _MessageMeta({this.trace});
+
+  /// The reasoning trace that produced the paired answer.
+  final Map<String, Object?>? trace;
+}
+
+String _truncate(Object? value, [int limit = 60]) {
+  final String text = '$value';
+  return text.length <= limit ? text : '${text.substring(0, limit)}…';
+}
+
+/// The collapsible reasoning card: what the assistant planned to do, and what
+/// its check found. Expanded while a turn runs — a visible plan is the
+/// difference between "thinking" and "frozen" — collapsed once settled.
+class _ThinkingCard extends StatelessWidget {
+  const _ThinkingCard({
+    super.key,
+    required this.plan,
+    this.trace,
+    this.running = false,
+  });
+
+  /// The plan map (ThinkingPlan.toJson) this card renders.
+  final Map<String, Object?> plan;
+
+  /// The finished trace (ThinkingTrace.toJson), or null while streaming.
+  final Map<String, Object?>? trace;
+
+  /// Whether the turn this describes is still in flight.
+  final bool running;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme colors = Theme.of(context).colorScheme;
+    final TextTheme text = Theme.of(context).textTheme;
+    final String strategy = plan['strategy'] is String
+        ? plan['strategy']! as String
+        : 'thinking';
+    final String summary = trace != null && trace!['summary'] is String
+        ? trace!['summary']! as String
+        : 'Planning the answer…';
+    final Object? rawSteps = plan['steps'];
+    final List<Object?> steps =
+        rawSteps is List<Object?> ? rawSteps : const <Object?>[];
+    final bool revised = trace?['revised'] == true;
+    final Object? rawFindings = trace?['findings'];
+    final List<Object?> findings =
+        rawFindings is List<Object?> ? rawFindings : const <Object?>[];
+
+    return Card(
+      elevation: 0,
+      color: colors.surfaceContainerHighest,
+      child: ExpansionTile(
+        shape: const Border(),
+        initiallyExpanded: running,
+        leading: Icon(
+          running ? Icons.psychology_outlined : Icons.fact_check_outlined,
+          size: 20,
+          color: colors.primary,
+        ),
+        title: Text('Thinking', style: text.titleSmall),
+        subtitle: Text(summary, style: text.bodySmall),
+        trailing: Wrap(
+          spacing: 6,
+          children: <Widget>[
+            Chip(
+              visualDensity: VisualDensity.compact,
+              label: Text(strategy),
+            ),
+            if (revised)
+              const Chip(
+                visualDensity: VisualDensity.compact,
+                label: Text('revised'),
+              ),
+          ],
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        children: <Widget>[
+          for (final Object? rawStep in steps)
+            if (rawStep is Map<String, Object?>)
+              _ThinkingStep(row: rawStep)
+            else
+              Text('$rawStep', style: text.bodySmall),
+          if (findings.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 4),
+            Text(
+              'Check found ${findings.length} issue(s):',
+              style: text.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+            ),
+            for (final Object? rawFinding in findings)
+              if (rawFinding is Map<String, Object?>)
+                Text(
+                  '• ${rawFinding['message'] ?? rawFinding['code'] ?? ''}',
+                  style: text.bodySmall,
+                ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ThinkingStep extends StatelessWidget {
+  const _ThinkingStep({required this.row});
+
+  final Map<String, Object?> row;
+
+  @override
+  Widget build(BuildContext context) {
+    final TextTheme text = Theme.of(context).textTheme;
+    final String status = row['status'] is String ? row['status']! as String : 'pending';
+    final IconData icon = switch (status) {
+      'done' => Icons.check_circle_outline,
+      'running' => Icons.pending_outlined,
+      'failed' => Icons.error_outline,
+      'skipped' => Icons.remove_circle_outline,
+      _ => Icons.radio_button_unchecked,
+    };
+    final String? result = row['result'] is String ? row['result']! as String : null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(icon, size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  row['title'] is String ? row['title']! as String : '',
+                  style: text.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                if (row['detail'] is String)
+                  Text(row['detail']! as String, style: text.bodySmall),
+                if (result != null)
+                  Text(result, style: text.bodySmall?.copyWith(fontStyle: FontStyle.italic)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// The scrolling transcript, with one bubble per role.
@@ -2234,6 +2856,7 @@ class _ChatPaneState extends State<ChatPane> {
 class _ChatTranscript extends StatelessWidget {
   const _ChatTranscript({
     required this.messages,
+    required this.metas,
     required this.streaming,
     required this.runningTool,
     required this.controller,
@@ -2241,6 +2864,9 @@ class _ChatTranscript extends StatelessWidget {
 
   /// Completed messages, oldest first.
   final List<ChatMessage> messages;
+
+  /// Reasoning traces paired with assistant messages by index.
+  final List<_MessageMeta> metas;
 
   /// Text generated so far in the running turn, or an empty string.
   final String streaming;
@@ -2267,7 +2893,8 @@ class _ChatTranscript extends StatelessWidget {
               textAlign: TextAlign.center,
             ),
           ),
-        for (final ChatMessage message in messages) _bubble(context, message),
+        for (int i = 0; i < messages.length; i++)
+          _bubble(context, messages[i], _metaFor(messages[i], i)),
         if (streaming.isNotEmpty) _bubbleText(context, streaming, false),
         if (tool != null)
           Padding(
@@ -2288,13 +2915,51 @@ class _ChatTranscript extends StatelessWidget {
     );
   }
 
+  /// The trace attached to an assistant message, if one was recorded.
+  ///
+  /// Traces are matched by walking both lists in send order rather than stored
+  /// on the message: [ChatMessage] is a portable value type and a dashboard
+  /// decoration must not leak into the wire format.
+  _MessageMeta? _metaFor(ChatMessage message, int index) {
+    if (message.role != ChatRole.assistant) {
+      return null;
+    }
+    int seen = 0;
+    for (int i = 0; i <= index && i < messages.length; i++) {
+      if (messages[i].role == ChatRole.assistant) {
+        seen++;
+      }
+    }
+    final int metaIndex = seen - 1;
+    if (metaIndex < 0 || metaIndex >= metas.length) {
+      return null;
+    }
+    final _MessageMeta meta = metas[metaIndex];
+    return meta.trace == null ? null : meta;
+  }
+
   /// Renders one finished message according to its role.
-  Widget _bubble(BuildContext context, ChatMessage message) {
+  Widget _bubble(BuildContext context, ChatMessage message, _MessageMeta? meta) {
     switch (message.role) {
       case ChatRole.user:
         return _bubbleText(context, message.content, true);
       case ChatRole.assistant:
-        return _bubbleText(context, message.content, false);
+        final Map<String, Object?>? trace = meta?.trace;
+        if (trace == null) {
+          return _bubbleText(context, message.content, false);
+        }
+        // The answer and the reasoning that produced it stay visually bound:
+        // the card sits directly above its bubble, collapsed, so the transcript
+        // reads as a conversation with an expandable "how" on each turn.
+        final Object? plan = trace['plan'];
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            if (plan is Map<String, Object?>)
+              _ThinkingCard(plan: plan, trace: trace),
+            _bubbleText(context, message.content, false),
+          ],
+        );
       case ChatRole.tool:
         return _toolCard(context, message);
       case ChatRole.system:

@@ -14,6 +14,9 @@
 // of the contract, and the barrel is what keeps the three builds honest about
 // depending on the same surface.
 
+// ---- Assistant -----------------------------------------------------------
+export 'src/assistant/harbor_assistant.dart';
+
 // ---- Chat ----------------------------------------------------------------
 export 'src/chat/chat_engine.dart';
 export 'src/chat/chat_message.dart';
@@ -26,6 +29,11 @@ export 'src/corpus/device_text.dart';
 export 'src/corpus/html_text.dart';
 export 'src/corpus/web_collector.dart';
 
+// ---- Memory --------------------------------------------------------------
+export 'src/memory/memory_entry.dart';
+export 'src/memory/memory_extractor.dart';
+export 'src/memory/memory_store.dart';
+
 // ---- Model runtime -------------------------------------------------------
 export 'src/model/blocks.dart';
 export 'src/model/encoding.dart';
@@ -33,6 +41,9 @@ export 'src/model/interfaces.dart';
 export 'src/model/linalg.dart';
 export 'src/model/tiny_lm.dart';
 export 'src/model/trainable_model.dart';
+
+// ---- Reasoning -----------------------------------------------------------
+export 'src/reasoning/thinking.dart';
 
 // ---- Tokenizer -----------------------------------------------------------
 export 'src/tokenizer/byte_tokenizer.dart';

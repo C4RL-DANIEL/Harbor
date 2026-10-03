@@ -25,16 +25,21 @@ import 'package:path_provider/path_provider.dart';
 import 'core/agent/extended_thinking.dart';
 import 'core/agent/file_readers.dart';
 import 'core/agent/subagent_runner.dart';
+import 'core/auto/auto_pilot.dart';
+import 'core/chat/assistant_settings.dart';
 import 'core/chat/chat_controller.dart';
+import 'core/chat/chat_engine_factory.dart';
 import 'core/corpus/corpus_controller.dart';
 import 'core/corpus/corpus_persistence.dart';
 import 'core/corpus/device_collector.dart';
 import 'core/engine/fine_grained_moe.dart';
 import 'core/engine/mla_attention.dart';
 import 'core/engine/on_device_lora.dart';
+import 'core/memory/harbor_memory_storage.dart';
 import 'core/model/harbor_model_runtime.dart';
 import 'core/platform/platform_bridge.dart';
 import 'core/platform/platform_device_state.dart';
+import 'core/tools/tool_catalog.dart';
 import 'core/tools/tools_controller.dart';
 import 'core/training/training_controller.dart';
 import 'core/update_engine/dynamic_feature_flag_provider.dart';
@@ -44,7 +49,9 @@ import 'features/dynamic_module_registry.dart';
 import 'features/screens/chat_screen.dart';
 import 'features/screens/corpus_screen.dart';
 import 'features/screens/tools_screen.dart';
+import 'features/screens/memory_screen.dart';
 import 'features/screens/training_screen.dart';
+import 'features/widgets/one_tap_setup_card.dart';
 
 /// Material 3 seed colour for the Harbor brand.
 const Color kHarborSeedColor = Color(0xFF2F6FED);
@@ -253,6 +260,9 @@ class HarborServices {
     required this.corpus,
     required this.tools,
     required this.chat,
+    required this.memory,
+    required this.assistantSettings,
+    required this.autoPilot,
     required this.training,
     required this.platformDeviceState,
   });
@@ -294,6 +304,24 @@ class HarborServices {
   /// The assistant.
   final ChatController chat;
 
+  /// What the assistant remembers between launches.
+  ///
+  /// The engine reads and writes this store during a turn and the controller
+  /// holds the same reference for the UI, so both are exposed here rather than
+  /// reconstructed — two stores over one file would each overwrite the other's
+  /// write-behind save.
+  final hc.MemoryStore memory;
+
+  /// The user's memory / learning / reasoning switches.
+  ///
+  /// Persisted, so a person who turns thinking off is still not thinking on the
+  /// next launch. Changing a value rebuilds the chat engine through its
+  /// [AssistantSettings.onChange] hook wired in [_buildServices].
+  final AssistantSettings assistantSettings;
+
+  /// The one-tap setup and background self-maintenance loop.
+  final AutoPilotController autoPilot;
+
   /// The training pipeline.
   final TrainingController training;
 
@@ -316,6 +344,7 @@ class HarborServices {
     updateService.dispose();
     httpClient.close();
     chat.dispose();
+    autoPilot.dispose();
     training.dispose();
     corpus.dispose();
     tools.dispose();
@@ -460,14 +489,10 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
       HarborModelRuntime(layout: storage);
   await modelRuntime.bootstrap(corpusStore.trainingText(maxChars: 24000));
 
-  final hc.ToolRegistry toolRegistry = hc.ToolRegistry(<hc.Tool>[
-    ...hc.deviceTools(hostCallerFrom(bridge)),
-    ...hc.webTools(
-      client: httpClient,
-      allow: (Uri uri) => uri.scheme == 'https',
-      maxBytes: 256 * 1024,
-    ),
-  ]);
+  final hc.ToolRegistry toolRegistry = buildToolRegistry(
+    bridge: bridge,
+    client: httpClient,
+  );
 
   final ToolsController tools = ToolsController(
     registry: toolRegistry,
@@ -486,18 +511,54 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
       );
   final hc.Tokenizer chatTokenizer = modelRuntime.tokenizer ?? fallbackTokenizer;
 
+  // ---- Memory, reasoning and the switches that control them --------------
+  // Memory lives beside the corpus and the checkpoint because it is the same
+  // kind of artefact: learned locally, worth keeping across launches, safe to
+  // delete. The defaults are ON — an assistant that only remembers after you
+  // find a settings page makes the user do the assistant's job.
+  final hc.MemoryStore memory = hc.MemoryStore(
+    storage: FileMemoryStorage(storage.memoryFile),
+  );
+  await memory.load();
+
+  final AssistantSettings assistantSettings =
+      AssistantSettings(file: File('${storage.root.path}/assistant.json'));
+  await assistantSettings.load();
+
   final ChatController chat = ChatController(
-    engine: hc.ChatEngine(
+    engine: buildChatEngine(
+      settings: assistantSettings,
       model: chatModel,
       tokenizer: chatTokenizer,
       tools: toolRegistry,
-      maxNewTokens: 96,
+      memory: memory,
       contextLength: modelRuntime.ready
           ? modelRuntime.config.contextLength
           : hc.TinyLmConfig.testPreset.contextLength,
     ),
     tokenizer: chatTokenizer,
+    memory: memory,
+    transcript: ChatTranscriptStore(storage.transcriptFile),
   );
+
+  // Toggling a switch rebuilds the engine rather than mutating one, because the
+  // engine's prompt shape is immutable by design: half a turn must not change
+  // what "memory on" means halfway through generating it.
+  assistantSettings.onChange = () {
+    chat.replaceEngine(
+      buildChatEngine(
+        settings: assistantSettings,
+        model: chatModel,
+        tokenizer: chatTokenizer,
+        tools: toolRegistry,
+        memory: memory,
+        contextLength: modelRuntime.ready
+            ? modelRuntime.config.contextLength
+            : hc.TinyLmConfig.testPreset.contextLength,
+      ),
+    );
+  };
+  await chat.restore();
 
   final TrainingController training = TrainingController(
     runtime: modelRuntime,
@@ -509,6 +570,18 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
   final DeviceStateSource? platformDeviceState =
       bridge.isSupported ? PlatformDeviceStateSource(bridge) : null;
 
+  // Auto-Pilot: the one-tap path that runs gather → build → train, and the
+  // background poll that keeps learning while the phone charges. It gates on the
+  // real device state, so a user who taps "Get started" gets a working assistant
+  // without having to learn the pipeline's order first.
+  final AutoPilotController autoPilot = AutoPilotController(
+    corpus: corpus,
+    runtime: modelRuntime,
+    training: training,
+    deviceState: platformDeviceState ?? deviceStateSource,
+    memory: memory,
+  );
+
   return HarborServices(
     config: config,
     bridge: bridge,
@@ -518,6 +591,9 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
     corpus: corpus,
     tools: tools,
     chat: chat,
+    memory: memory,
+    assistantSettings: assistantSettings,
+    autoPilot: autoPilot,
     training: training,
     platformDeviceState: platformDeviceState,
     attention: attention,
@@ -794,6 +870,21 @@ class _HarborHomePageState extends State<HarborHomePage> {
           title: const Text('Harbor'),
           actions: <Widget>[
             IconButton(
+              tooltip: 'Memory',
+              onPressed: _forced
+                  ? null
+                  : () => unawaited(
+                        Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (BuildContext context) => MemoryScreen(
+                              controller: services.chat,
+                            ),
+                          ),
+                        ),
+                      ),
+              icon: const Icon(Icons.psychology_outlined),
+            ),
+            IconButton(
               tooltip: 'Engine diagnostics',
               onPressed: _forced ? null : () => _openEngineTab(services),
               icon: const Icon(Icons.memory_outlined),
@@ -1005,13 +1096,28 @@ class _WorkspaceTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return DynamicModuleContextBuilder(
-      services: services,
-      builder: (DynamicModuleContext moduleContext) => services.registry.buildLayout(
-        context,
-        services.flags.layout,
-        moduleContext,
-      ),
+    // The setup card is deliberately outside the server-driven layout: a
+    // feature-flag matrix must never be able to hide the one control that makes
+    // the app usable from scratch, and a remote flag that fails to load would
+    // otherwise leave a new install with no entry point at all.
+    return Column(
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+          child: OneTapSetupCard(autoPilot: services.autoPilot),
+        ),
+        Expanded(
+          child: DynamicModuleContextBuilder(
+            services: services,
+            builder: (DynamicModuleContext moduleContext) =>
+                services.registry.buildLayout(
+              context,
+              services.flags.layout,
+              moduleContext,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1319,6 +1425,8 @@ class _SettingsTabState extends State<_SettingsTab> {
           ],
         ),
         const SizedBox(height: 12),
+        _AssistantSection(services: services),
+        const SizedBox(height: 12),
         _SettingsSection(
           title: 'Simulated device state',
           description:
@@ -1491,6 +1599,146 @@ class _SettingsTabState extends State<_SettingsTab> {
         ),
         const SizedBox(height: 24),
       ],
+    );
+  }
+}
+
+/// The assistant's own switches: memory, learning and reasoning.
+///
+/// These three are the difference between an assistant that just works and one
+/// that needs a manual, so they live at the top of Settings rather than buried
+/// under Labs, and they take effect on the very next turn because changing them
+/// rebuilds the chat engine (see [AssistantSettings.onChange]).
+class _AssistantSection extends StatelessWidget {
+  const _AssistantSection({required this.services});
+
+  final HarborServices services;
+
+  @override
+  Widget build(BuildContext context) {
+    final AssistantSettings settings = services.assistantSettings;
+    final AutoPilotController autoPilot = services.autoPilot;
+    return ListenableBuilder(
+      listenable: Listenable.merge(<Listenable>[settings, autoPilot]),
+      builder: (BuildContext context, Widget? child) {
+        return _SettingsSection(
+          title: 'Assistant',
+          description: 'On by default. Everything below is stored on this '
+              'device and takes effect on the next message.',
+          children: <Widget>[
+            SwitchListTile(
+              key: const ValueKey<String>('settings.memory'),
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Remember what you tell it'),
+              subtitle: Text(
+                settings.memoryEnabled
+                    ? '${services.memory.length} memories stored; relevant '
+                        'ones are read back into every answer.'
+                    : 'Answers ignore everything from earlier conversations.',
+              ),
+              value: settings.memoryEnabled,
+              onChanged: settings.setMemoryEnabled,
+            ),
+            SwitchListTile(
+              key: const ValueKey<String>('settings.learning'),
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Learn from conversation'),
+              subtitle: const Text(
+                'Turns statements like "my name is" or "I prefer" into '
+                'memories automatically.',
+              ),
+              value: settings.learningEnabled,
+              onChanged: settings.setLearningEnabled,
+            ),
+            SwitchListTile(
+              key: const ValueKey<String>('settings.auto_thinking'),
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Think before answering'),
+              subtitle: Text(
+                settings.autoThinking
+                    ? 'Chooses per question: a greeting answers directly, a '
+                        'hard one gets a plan and a check.'
+                    : 'Pinned to ${settings.thinkingMode.label}.',
+              ),
+              value: settings.thinkingEnabled,
+              onChanged: (bool value) {
+                if (value) {
+                  settings.setFullyAutomatic();
+                } else {
+                  settings.setThinkingMode(hc.ThinkingStrategy.none);
+                }
+              },
+            ),
+            if (settings.thinkingEnabled && !settings.autoThinking)
+              Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: Wrap(
+                  spacing: 8,
+                  children: <Widget>[
+                    for (final hc.ThinkingStrategy strategy
+                        in <hc.ThinkingStrategy>[
+                      hc.ThinkingStrategy.concise,
+                      hc.ThinkingStrategy.thorough,
+                    ])
+                      ChoiceChip(
+                        key: ValueKey<String>(
+                          'settings.thinking.${strategy.wire}',
+                        ),
+                        label: Text(strategy.label),
+                        selected: settings.thinkingMode == strategy,
+                        onSelected: (_) => settings.setThinkingMode(strategy),
+                      ),
+                  ],
+                ),
+              ),
+            const Divider(height: 24),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: Text(
+                    autoPilot.status.message,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  key: const ValueKey<String>('settings.setup'),
+                  onPressed: autoPilot.busy
+                      ? null
+                      : () => unawaited(autoPilot.runSetup()),
+                  icon: const Icon(Icons.bolt),
+                  label: const Text('Set up now'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: Text(
+                    'Keep learning while charging',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ),
+                Switch(
+                  key: const ValueKey<String>('settings.auto_learn'),
+                  value: autoPilot.autoLearn,
+                  onChanged: autoPilot.setAutoLearn,
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Gated on the real battery and thermal sensors: nothing runs '
+              'below 35% or when the phone is hot.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        );
+      },
     );
   }
 }

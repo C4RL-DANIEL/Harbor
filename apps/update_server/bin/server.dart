@@ -3,34 +3,28 @@
 // Pure Dart VM executable: `dart run bin/server.dart --port 8080`.
 // It serves the JSON API (lib/src/api_router.dart) and, when the Flutter Web
 // admin dashboard has been built, the static `build/web` bundle at `/`.
-
 import 'dart:async';
 import 'dart:io';
-
 import 'package:args/args.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_static/shelf_static.dart';
-
 import 'package:update_server/src/api_router.dart';
 import 'package:update_server/src/chat_service.dart';
+import 'package:update_server/src/memory_service.dart';
 import 'package:update_server/src/lifecycle.dart';
 import 'package:update_server/src/models.dart';
 import 'package:update_server/src/release_store.dart';
-
 const String _serviceName = 'harbor-update-server';
-
 /// The token accepted when `HARBOR_ALLOW_DEV_TOKEN=true` and no real token is
 /// configured. Never enable this in production.
 const String _devAdminToken = 'dev';
-
 /// Upper bound on each step of a SIGTERM/SIGINT shutdown: how long stopping the
 /// listener may take, and how long in-flight requests are given to finish
 /// before their sockets are destroyed. A shutdown therefore completes in at
 /// most roughly twice this value.
 const Duration _shutdownGrace = Duration(seconds: 5);
-
 void main(List<String> arguments) async {
   final ArgParser parser = _buildArgParser();
   final ArgResults options;
@@ -42,18 +36,15 @@ void main(List<String> arguments) async {
     exitCode = 64;
     return;
   }
-
   if (options.flag('help')) {
     stdout.writeln('Harbor update server\n');
     stdout.writeln(parser.usage);
     return;
   }
-
   final int? port = int.tryParse(options.option('port') ?? '');
   final String host = options.option('host') ?? '0.0.0.0';
   final String stateFile =
       options.option('state-file') ?? './data/state.json';
-
   if (port == null || port < 0 || port > 65535) {
     stderr.writeln(
       'Invalid --port ${options.option('port')} (expected an integer '
@@ -62,10 +53,8 @@ void main(List<String> arguments) async {
     exitCode = 64;
     return;
   }
-
   final String adminToken = _resolveAdminToken();
   final ReleaseStore store = ReleaseStore(stateFile);
-
   try {
     await store.load();
   } on StateStoreException catch (error) {
@@ -73,24 +62,29 @@ void main(List<String> arguments) async {
     exitCode = 1;
     return;
   }
-
   // The chat model is prepared with the other stores so the first request does
   // not pay the tokenizer-training and initialisation cost. A failure here is
   // logged and survived: the update API must keep serving even when the model
   // cannot be built, and the chat routes then report the failure themselves.
-  final HarborChatService chatService = HarborChatService();
+  // Memory lives beside the state file: both are durable, operator-visible,
+  // and neither should be a surprise to whoever backs this directory up.
+  final FileMemoryStorage memoryStorage = FileMemoryStorage(
+    File('${File(stateFile).parent.path}/memory.json'),
+  );
+  final HarborChatService chatService =
+      HarborChatService(memoryStorage: memoryStorage);
   try {
     await chatService.initialize();
     final Map<String, Object?> chatStatus = chatService.status();
     _log(
       'chat model ready: ${chatStatus['vocabulary']} tokens, '
       '${chatStatus['parameters']} parameters, '
-      'context ${chatStatus['context_length']}',
+      'context ${chatStatus['context_length']}, '
+      '${chatService.memory.length} memories loaded',
     );
   } on Object catch (error) {
     _log('chat model unavailable: $error');
   }
-
   final Directory? webDirectory = _findWebDirectory();
   final Router router = buildRouter(
     store: store,
@@ -106,7 +100,6 @@ void main(List<String> arguments) async {
       .addMiddleware(etagMiddleware())
       .addMiddleware(tracker.wrap)
       .addHandler(_composeHandler(router, webDirectory));
-
   final HttpServer server;
   try {
     server = await shelf_io.serve(
@@ -123,7 +116,6 @@ void main(List<String> arguments) async {
     exitCode = 1;
     return;
   }
-
   _log('listening on http://${server.address.host}:${server.port}');
   _log('state file: ${store.path ?? '<in-memory>'}');
   _log(
@@ -136,9 +128,7 @@ void main(List<String> arguments) async {
   } else {
     _log('no build/web found; serving the JSON landing page at /');
   }
-
   await _awaitShutdown(server, store, tracker);
-
   // Signal subscriptions and the HTTP server keep the Dart event loop alive
   // after main() returns, so a process that only awaits its shutdown work
   // would linger until the supervisor SIGKILLs it. Terminate explicitly once
@@ -146,7 +136,6 @@ void main(List<String> arguments) async {
   await stdout.flush();
   exit(0);
 }
-
 ArgParser _buildArgParser() {
   final String defaultHost = Platform.environment['HARBOR_HOST'] ?? '0.0.0.0';
   final String defaultPort = Platform.environment['HARBOR_PORT'] ??
@@ -154,7 +143,6 @@ ArgParser _buildArgParser() {
       '8080';
   final String defaultStateFile =
       Platform.environment['HARBOR_STATE_FILE'] ?? './data/state.json';
-
   return ArgParser()
     ..addOption(
       'port',
@@ -179,7 +167,6 @@ ArgParser _buildArgParser() {
       help: 'Show this usage information.',
     );
 }
-
 String _resolveAdminToken() {
   final Map<String, String> env = Platform.environment;
   final String configured =
@@ -193,11 +180,9 @@ String _resolveAdminToken() {
   }
   return '';
 }
-
 // ---------------------------------------------------------------------------
 // Static dashboard / landing page
 // ---------------------------------------------------------------------------
-
 Directory? _findWebDirectory() {
   final Directory scriptDirectory = _scriptDirectory();
   final List<Directory> candidates = <Directory>[
@@ -212,7 +197,6 @@ Directory? _findWebDirectory() {
   }
   return null;
 }
-
 Directory _scriptDirectory() {
   final Uri script = Platform.script;
   if (script.scheme == 'file') {
@@ -220,7 +204,6 @@ Directory _scriptDirectory() {
   }
   return Directory.current;
 }
-
 Handler _composeHandler(Router router, Directory? webDirectory) {
   if (webDirectory != null) {
     final Handler staticHandler = createStaticHandler(
@@ -256,7 +239,6 @@ Handler _composeHandler(Router router, Directory? webDirectory) {
       return apiResponse;
     };
   }
-
   return (Request request) async {
     final String path = request.url.path;
     if (request.method == 'GET' && (path.isEmpty || path == '/')) {
@@ -265,7 +247,6 @@ Handler _composeHandler(Router router, Directory? webDirectory) {
     return router.call(request);
   };
 }
-
 Response _landingResponse() {
   const List<Map<String, Object?>> routes = <Map<String, Object?>>[
     <String, Object?>{'method': 'GET', 'path': '/health', 'auth': false},
@@ -302,11 +283,9 @@ Response _landingResponse() {
     'routes': routes,
   });
 }
-
 // ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
-
 Middleware _logMiddleware(void Function(String) log) {
   return (Handler inner) {
     return (Request request) async {
@@ -328,14 +307,11 @@ Middleware _logMiddleware(void Function(String) log) {
     };
   };
 }
-
 // CORS + ETag middleware live in lib/src/api_router.dart so the exact same
 // implementations can be exercised by the HTTP tests.
-
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
-
 Future<void> _awaitShutdown(
   HttpServer server,
   ReleaseStore store,
@@ -343,7 +319,6 @@ Future<void> _awaitShutdown(
 ) async {
   final Completer<void> finished = Completer<void>();
   bool started = false;
-
   Future<void> shutdown(String signal) async {
     if (started) {
       _log('ignoring $signal: shutdown is already in progress');
@@ -358,7 +333,6 @@ Future<void> _awaitShutdown(
       } on TimeoutException {
         _log('stopping the listener exceeded ${_shutdownGrace.inSeconds}s');
       }
-
       // 2. Give those requests a bounded window to finish, so a client is not
       //    cut off by the exit that follows.
       try {
@@ -367,7 +341,6 @@ Future<void> _awaitShutdown(
         _log('${tracker.active} request(s) still in flight after '
             '${_shutdownGrace.inSeconds}s; forcing connections closed');
       }
-
       // 3. Destroy whatever is left, then persist state.
       try {
         await server.close(force: true);
@@ -382,7 +355,6 @@ Future<void> _awaitShutdown(
       finished.complete();
     }
   }
-
   ProcessSignal.sigint.watch().listen((_) {
     unawaited(shutdown('SIGINT'));
   });
@@ -391,10 +363,8 @@ Future<void> _awaitShutdown(
       unawaited(shutdown('SIGTERM'));
     });
   }
-
   await finished.future;
 }
-
 void _log(String message) {
   stdout.writeln(
     '[$_serviceName] ${DateTime.now().toUtc().toIso8601String()} $message',

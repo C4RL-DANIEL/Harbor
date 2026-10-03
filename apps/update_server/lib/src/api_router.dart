@@ -120,6 +120,25 @@ Router buildRouter({
     (Request request) => _chat(request, service, log),
   );
 
+  // ---- Memory ----------------------------------------------------------
+  // Read is unauthenticated because it returns only what the operator has
+  // already shown to the dashboard, and the chat pane needs it to render the
+  // memory strip. Every mutation is admin-gated: forgetting on someone else's
+  // behalf is not a public operation.
+  router.get('/api/v1/memory', (Request request) => _listMemory(service));
+  router.post(
+    '/api/v1/memory',
+    (Request request) => _addMemory(request, service, adminToken, log),
+  );
+  router.post(
+    '/api/v1/memory/clear',
+    (Request request) => _clearMemory(request, service, adminToken, log),
+  );
+  router.delete(
+    '/api/v1/memory/<id>',
+    (Request request, String id) => _forgetMemory(request, id, service, adminToken, log),
+  );
+
   // Catch-all so unknown routes answer with the JSON error envelope.
   router.all('/<ignored|.*>', (Request request) {
     throw NotFoundException(
@@ -133,7 +152,7 @@ Router buildRouter({
 /// The CORS headers applied to every response, including errors.
 const Map<String, String> corsHeaders = <String, String>{
   'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
+  'access-control-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'access-control-allow-headers': 'X-Admin-Token, Content-Type',
   'access-control-max-age': '86400',
 };
@@ -487,7 +506,32 @@ Future<_ChatRequest> _readChatRequest(Request request) async {
   return _ChatRequest(
     messages: messages,
     maxTokens: _readMaxTokens(decoded['max_tokens']),
+    useMemory: _optionalBool(decoded, 'memory'),
+    thinking: _readThinking(decoded['thinking']),
   );
+}
+
+/// The reasoning depth requested for one turn.
+///
+/// `auto` (and an absent field) both return null, meaning "let the engine
+/// choose per turn" — the two spellings collapse to the same behaviour because
+/// an omitted field must not silently mean something different from the value
+/// that documents the default.
+String? _readThinking(Object? value) {
+  if (value == null) {
+    return null;
+  }
+  if (value is! String) {
+    throw const ValidationException('"thinking" must be a string');
+  }
+  final String mode = value.trim().toLowerCase();
+  const List<String> allowed = <String>['auto', 'none', 'concise', 'thorough'];
+  if (!allowed.contains(mode)) {
+    throw ValidationException(
+      '"thinking" must be one of ${allowed.join(', ')}; got "$value"',
+    );
+  }
+  return mode == 'auto' ? null : mode;
 }
 
 /// Reads `max_tokens`, defaulting it and capping it at [kChatMaxTokensCap].
@@ -531,6 +575,8 @@ Response _streamingChat(
   final Stream<ChatEvent> events = service.respond(
     parsed.messages,
     maxNewTokens: parsed.maxTokens,
+    useMemory: parsed.useMemory,
+    thinking: parsed.thinking,
   );
   return Response.ok(
     _sseStream(events, log),
@@ -580,6 +626,23 @@ Map<String, Object?> _ssePayload(ChatEvent event) => switch (event) {
           'ok': result.ok,
           'summary': result.summary,
         },
+      ChatThinking(:final ThinkingPlan plan, :final ThinkingTrace? trace) =>
+        <String, Object?>{
+          'type': 'thinking',
+          'plan': plan.toJson(),
+          'trace': trace?.toJson(),
+        },
+      ChatMemoryUpdated(
+        :final List<MemoryEntry> entries,
+        :final bool explicit,
+      ) =>
+        <String, Object?>{
+          'type': 'memory_updated',
+          'entries': <Object?>[
+            for (final MemoryEntry entry in entries) entry.toJson(),
+          ],
+          'explicit': explicit,
+        },
       ChatFinished(
         :final String text,
         :final int generatedTokens,
@@ -606,6 +669,8 @@ Future<Response> _bufferedChat(
   await for (final ChatEvent event in service.respond(
     parsed.messages,
     maxNewTokens: parsed.maxTokens,
+    useMemory: parsed.useMemory,
+    thinking: parsed.thinking,
   )) {
     switch (event) {
       case ChatToken(:final String text):
@@ -616,6 +681,8 @@ Future<Response> _bufferedChat(
         failure = message;
       case ChatToolStarted():
       case ChatToolFinished():
+      case ChatThinking():
+      case ChatMemoryUpdated():
         break;
     }
   }
@@ -640,13 +707,144 @@ Future<Response> _bufferedChat(
 
 /// A validated chat request.
 class _ChatRequest {
-  const _ChatRequest({required this.messages, required this.maxTokens});
+  const _ChatRequest({
+    required this.messages,
+    required this.maxTokens,
+    this.useMemory,
+    this.thinking,
+  });
 
   /// The conversation, oldest first.
   final List<ChatMessage> messages;
 
   /// The token budget for this turn.
   final int maxTokens;
+
+  /// Per-turn memory opt-out, or null for the server default.
+  final bool? useMemory;
+
+  /// Per-turn reasoning depth, or null to let the engine choose.
+  final String? thinking;
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+
+/// The kinds a client may name in `POST /api/v1/memory`.
+///
+/// Listed from [MemoryKind] rather than hard-coded so a new kind cannot be
+/// added to the runtime without the API accepting it. A built list rather than
+/// a const one, because the comprehension over the enum is not a constant
+/// expression — the immutability the message needs is the enum's own.
+final List<String> _memoryKinds = List<String>.unmodifiable(<String>[
+  for (final MemoryKind kind in MemoryKind.values) kind.wire,
+]);
+
+/// `GET /api/v1/memory` — every stored memory, newest first.
+Future<Response> _listMemory(HarborChatService service) async {
+  await service.initialize();
+  return jsonResponse(<String, Object?>{
+    'entries': <Object?>[
+      for (final MemoryEntry entry in service.memory.entries) entry.toJson(),
+    ],
+    'stats': service.memory.describe(),
+  });
+}
+
+/// `POST /api/v1/memory` — remember one thing on the operator's behalf.
+///
+/// Importance defaults to 1.0 rather than the extractor's softer values: an
+/// explicit API write is as deliberate as a user saying "remember this", and
+/// the store prunes on importance, so a half-weighted manual entry would be
+/// the first thing lost.
+Future<Response> _addMemory(
+  Request request,
+  HarborChatService service,
+  String adminToken,
+  void Function(String) log,
+) async {
+  _requireAdmin(request, adminToken);
+  final Map<String, Object?> body = await _readJsonObject(request);
+  final String text = _requireString(body, 'text');
+
+  final Object? rawKind = body['kind'];
+  MemoryKind kind = MemoryKind.fact;
+  if (rawKind != null) {
+    if (rawKind is! String || MemoryKind.tryParse(rawKind) == null) {
+      throw ValidationException(
+        '"kind" must be one of ${_memoryKinds.join(', ')}; got "$rawKind"',
+      );
+    }
+    kind = MemoryKind.tryParse(rawKind)!;
+  }
+
+  final Object? rawImportance = body['importance'];
+  double importance = 1.0;
+  if (rawImportance != null) {
+    if (rawImportance is! num ||
+        rawImportance < 0 ||
+        rawImportance > 1) {
+      throw const ValidationException(
+        '"importance" must be a number between 0 and 1',
+      );
+    }
+    importance = rawImportance.toDouble();
+  }
+
+  final Object? rawSubject = body['subject'];
+  if (rawSubject != null && rawSubject is! String) {
+    throw const ValidationException('"subject" must be a string');
+  }
+
+  await service.initialize();
+  final MemoryEntry entry = service.memory.remember(
+    text,
+    kind: kind,
+    subject: rawSubject is String ? rawSubject : null,
+    importance: importance,
+    source: 'api',
+  );
+  await service.memory.flush();
+  log('memory: stored ${entry.kind.wire} ${entry.id}');
+  return jsonResponse(<String, Object?>{'entry': entry.toJson()});
+}
+
+/// `DELETE /api/v1/memory/<id>` — forget one memory.
+///
+/// Reports `deleted: false` for an unknown id rather than a 404: the caller's
+/// intent (this must not be remembered) is satisfied either way, and a boolean
+/// keeps the dashboard's row removal idempotent under a double tap.
+Future<Response> _forgetMemory(
+  Request request,
+  String id,
+  HarborChatService service,
+  String adminToken,
+  void Function(String) log,
+) async {
+  _requireAdmin(request, adminToken);
+  await service.initialize();
+  final bool deleted = service.memory.forget(id);
+  if (deleted) {
+    await service.memory.flush();
+    log('memory: forgot $id');
+  }
+  return jsonResponse(<String, Object?>{'deleted': deleted});
+}
+
+/// `POST /api/v1/memory/clear` — drop every memory.
+Future<Response> _clearMemory(
+  Request request,
+  HarborChatService service,
+  String adminToken,
+  void Function(String) log,
+) async {
+  _requireAdmin(request, adminToken);
+  await service.initialize();
+  final int count = service.memory.length;
+  await service.memory.clear();
+  log('memory: cleared $count entries');
+  return jsonResponse(<String, Object?>{'cleared': true, 'count': count});
 }
 
 // ---------------------------------------------------------------------------

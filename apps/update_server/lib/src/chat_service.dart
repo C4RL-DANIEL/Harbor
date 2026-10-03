@@ -57,7 +57,13 @@ class HarborChatService {
     this.config = TinyLmConfig.browserPreset,
     String? seedCorpus,
     int maxNewTokens = kChatDefaultMaxTokens,
+    MemoryStorage? memoryStorage,
+    this.memoryEnabled = true,
+    this.thinkingEnabled = true,
   })  : _seedCorpus = seedCorpus ?? '',
+        memory = MemoryStore(
+          storage: memoryStorage ?? InMemoryMemoryStorage(),
+        ),
         maxNewTokens =
             maxNewTokens < 1 ? 1 : math.min(maxNewTokens, kChatMaxTokensCap);
 
@@ -72,6 +78,20 @@ class HarborChatService {
 
   final String _seedCorpus;
 
+  /// Whether recalled memories are injected into a prompt.
+  final bool memoryEnabled;
+
+  /// Whether turns are planned and checked before the answer is shown.
+  final bool thinkingEnabled;
+
+  /// The assistant's long-term memory.
+  ///
+  /// Owned here rather than per-engine: every request shares one store, so a
+  /// fact learned through the mobile client is visible to the dashboard on the
+  /// next turn. Storage is the caller's choice; without it memory is
+  /// process-scoped, which is the correct default for a test.
+  final MemoryStore memory;
+
   TinyLm? _model;
   ByteTokenizer? _tokenizer;
   ChatEngine? _engine;
@@ -85,7 +105,13 @@ class HarborChatService {
   /// second call after success returns the already-completed future. That is
   /// what makes it safe for a route handler to `await` on every request without
   /// re-training the tokenizer each time.
-  Future<void> initialize() => _initialization ??= Future<void>.sync(_buildOnce);
+  Future<void> initialize() => _initialization ??= Future<void>.sync(() async {
+        _buildOnce();
+        // Memory is read, not built, so a corrupt file must not stop the model
+        // from coming up. `load()` already swallows it; awaiting keeps the
+        // first turn honest about what the store holds.
+        await memory.load();
+      });
 
   /// The tool catalogue the chat engine may advertise.
   ///
@@ -101,9 +127,21 @@ class HarborChatService {
   Stream<ChatEvent> respond(
     List<ChatMessage> history, {
     int? maxNewTokens,
+    bool? useMemory,
+    String? thinking,
   }) async* {
     await initialize();
-    yield* _engineFor(maxNewTokens).respond(history);
+    final ChatEngine engine = _engineFor(maxNewTokens);
+    // `auto` means "let the engine choose per turn"; any other value is a
+    // request that overrides the standing depth for this turn only.
+    final ThinkingStrategy? override = thinking == null || thinking == 'auto'
+        ? null
+        : ThinkingStrategy.fromWire(thinking);
+    yield* engine.respond(
+      history,
+      useMemory: useMemory,
+      thinking: override,
+    );
   }
 
   /// A JSON description of the model for `/api/v1/chat/status`.
@@ -127,6 +165,14 @@ class HarborChatService {
       'seed_documents': _seedCorpus.trim().isEmpty ? 0 : 1,
       'seed_chars': _seedCorpus.length,
       'max_new_tokens': maxNewTokens,
+      'memory': <String, Object?>{
+        ...memory.describe(),
+        'enabled': memoryEnabled,
+      },
+      'thinking': <String, Object?>{
+        'enabled': thinkingEnabled,
+        'auto': thinkingEnabled,
+      },
     };
   }
 
@@ -157,6 +203,7 @@ class HarborChatService {
       model: model,
       tokenizer: tokenizer,
       tools: toolRegistry,
+      memory: memoryEnabled ? memory : null,
       maxNewTokens: maxNewTokens,
       // The engine reserves room to answer inside this window and shortens the
       // tool catalogue before it would truncate the conversation, so the model's
@@ -165,6 +212,12 @@ class HarborChatService {
       // window; that hid the problem instead of fixing it, and it promised the
       // caller more context than the model could attend.
       contextLength: model.contextLength,
+      // Reasoning is on by default and the per-turn chooser picks the depth, so
+      // a greeting is not charged for a plan while a hard question still gets
+      // checked before its answer is shown.
+      thinkingStrategy:
+          thinkingEnabled ? ThinkingStrategy.thorough : ThinkingStrategy.none,
+      autoThink: thinkingEnabled,
     );
   }
 
@@ -180,8 +233,11 @@ class HarborChatService {
       model: model,
       tokenizer: tokenizer,
       tools: toolRegistry,
+      memory: memoryEnabled ? memory : null,
       maxNewTokens: requestedMaxNewTokens,
       contextLength: engine.contextLength,
+      thinkingStrategy: engine.thinkingStrategy,
+      autoThink: engine.autoThink,
     );
   }
 

@@ -71,6 +71,12 @@ class HarborStorageLayout {
   /// A human-readable log of completed training rounds.
   File get trainingLogFile => File('${root.path}/training_log.jsonl');
 
+  /// The assistant's long-term memory.
+  File get memoryFile => File('${root.path}/memory.json');
+
+  /// The visible chat transcript, restored on the next launch.
+  File get transcriptFile => File('${root.path}/transcript.jsonl');
+
   /// Total bytes currently used by this layout, for the diagnostics panel.
   int get usedBytes {
     int total = 0;
@@ -80,6 +86,8 @@ class HarborStorageLayout {
       modelFile,
       trainingCheckpointFile,
       trainingLogFile,
+      memoryFile,
+      transcriptFile,
     ]) {
       if (file.existsSync()) {
         total += file.lengthSync();
@@ -96,6 +104,8 @@ class HarborStorageLayout {
       modelFile,
       trainingCheckpointFile,
       trainingLogFile,
+      memoryFile,
+      transcriptFile,
     ]) {
       if (file.existsSync()) {
         await file.delete();
