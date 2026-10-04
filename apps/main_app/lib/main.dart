@@ -15,7 +15,7 @@
 // environment-specific URL is ever committed to the repository.
 
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:harbor_core/harbor_core.dart' as hc;
