@@ -20,9 +20,14 @@ import '../corpus/corpus_persistence.dart';
 /// Owns the on-device tokenizer and model, and their files.
 class HarborModelRuntime extends ChangeNotifier {
   /// Creates a runtime persisting into [layout].
+  ///
+  /// [lowResource] shrinks the default config for older phones:
+  /// fewer layers, shorter context, smaller KV cache. The runtime
+  /// adapts generation to stay under the budget without blocking the UI.
   HarborModelRuntime({
     required this.layout,
     this.baseConfig = TinyLmConfig.onDevicePreset,
+    this.lowResource = false,
   });
 
   /// Where the tokenizer and checkpoint live.
@@ -32,6 +37,9 @@ class HarborModelRuntime extends ChangeNotifier {
   /// actual vocabulary wins, because the embedding table must match the merges
   /// that exist rather than the merges that were hoped for.
   final TinyLmConfig baseConfig;
+
+  /// Shrink the defaults for low-resource devices.
+  final bool lowResource;
 
   ByteTokenizer? _tokenizer;
   TinyLm? _model;
@@ -77,8 +85,18 @@ class HarborModelRuntime extends ChangeNotifier {
       final ByteTokenizer tokenizer = _tokenizer!;
 
       _setStatus('Building model');
-      final TinyLmConfig resolved =
+      TinyLmConfig resolved =
           baseConfig.copyWith(vocabSize: tokenizer.vocabSize);
+      // Low-resource devices get a smaller active config: fewer layers,
+      // shorter context, tighter KV compression. The embedding table
+      // still matches the tokenizer vocabulary.
+      if (lowResource) {
+        resolved = resolved.copyWith(
+          nLayers: 1,
+          contextLength: 128,
+          kvRank: (resolved.kvRank / 2).clamp(4, 16).toInt(),
+        );
+      }
       _model = await _loadOrCreateModel(resolved);
       _setStatus(
         'Ready · ${_model!.config.summary} · '

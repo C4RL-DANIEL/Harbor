@@ -15,7 +15,7 @@
 // environment-specific URL is ever committed to the repository.
 
 import 'dart:async';
-import 'dart:io';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:harbor_core/harbor_core.dart' as hc;
@@ -486,7 +486,7 @@ Future<HarborServices> _buildServices(HarborConfig config) async {
   await corpus.initialize();
 
   final HarborModelRuntime modelRuntime =
-      HarborModelRuntime(layout: storage);
+      HarborModelRuntime(layout: storage, lowResource: platformIsLowResource());
   await modelRuntime.bootstrap(corpusStore.trainingText(maxChars: 24000));
 
   final hc.ToolRegistry toolRegistry = buildToolRegistry(
@@ -635,6 +635,18 @@ List<Directory> _corpusRoots(Directory supportDirectory) {
   return roots;
 }
 
+/// Detects whether the device is low-resource.
+///
+/// Uses the runtime environment to check CPU cores. A device with
+/// 2 or fewer cores is treated as low-resource so the model
+/// shrinks automatically.
+bool platformIsLowResource() {
+  if (!Platform.isAndroid) {
+    return false;
+  }
+  return Platform.numberOfProcessors <= 2;
+}
+
 /// Provides [HarborServices] to the widget tree.
 class HarborScope extends InheritedWidget {
   const HarborScope({
@@ -745,8 +757,9 @@ class _HarborHomePageState extends State<HarborHomePage> {
     super.dispose();
   }
 
-  /// Restores cached flags, runs the silent update check, and starts the idle
-  /// training poll. Every step is failure-tolerant.
+  /// Restores cached flags, runs the silent update check, kicks off
+  /// automatic learning if the model is not ready yet, and starts the
+  /// idle-training poll. Every step is failure-tolerant.
   Future<void> _bootstrap() async {
     if (_bootstrapped || !mounted) {
       return;
@@ -765,6 +778,13 @@ class _HarborHomePageState extends State<HarborHomePage> {
       const Duration(seconds: 30),
       (_) => unawaited(_pollIdleTraining()),
     );
+
+    // Automatic setup: if the model is not ready yet, start the
+    // pipeline in the background so the app is usable immediately.
+    // No manual "Get started" tap needed.
+    if (!services.modelRuntime.ready && !services.autoPilot.busy) {
+      unawaited(services.autoPilot.runSetup());
+    }
 
     final FlagSyncResult sync = await services.flags.refresh();
     if (!mounted) {
