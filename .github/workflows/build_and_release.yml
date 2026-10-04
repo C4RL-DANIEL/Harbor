@@ -190,24 +190,47 @@ jobs:
             exit 0
           fi
 
-          sdkmanager="$(find "${sdk_root}/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | head -n1)"
+          sdkmanager="$(find "${sdk_root}/cmdline-tools" -maxdepth 4 -type f -name sdkmanager 2>/dev/null | head -n1)"
           if [ -z "${sdkmanager}" ]; then
-            echo "::error::sdkmanager was not found under ${sdk_root}/cmdline-tools."
-            exit 1
+            # Bootstrap the command-line tools so sdkmanager exists even on a
+            # fresh runner where cmdline-tools was never extracted.
+            echo "::warning::sdkmanager not found, bootstrapping cmdline-tools..."
+            yes | "${sdk_root}/cmdline-tools/bin/sdkmanager" --sdk_root="${sdk_root}" "cmdline-tools;latest" || true
+            sdkmanager="$(find "${sdk_root}/cmdline-tools" -maxdepth 4 -type f -name sdkmanager 2>/dev/null | head -n1)"
+            if [ -z "${sdkmanager}" ]; then
+              echo "::error::sdkmanager still not found after bootstrap. SDK tree:"
+              find "${sdk_root}" -maxdepth 3 -type d | sort | head -30
+              exit 1
+            fi
           fi
 
-          # pipefail is disabled for this one command so `yes` being killed by
-          # SIGPIPE (its normal exit once sdkmanager closes stdin) cannot fail
-          # the step; the pipeline still reports sdkmanager's own exit status.
-          set +o pipefail
-          yes | "${sdkmanager}" --sdk_root="${sdk_root}" --install "ndk;${NDK_VERSION}"
-          set -o pipefail
+          echo "Using sdkmanager: ${sdkmanager}"
+          echo "SDK root contents:"
+          find "${sdk_root}" -maxdepth 2 -type d | sort | head -20
 
-          if [ ! -d "${sdk_root}/ndk/${NDK_VERSION}" ]; then
-            echo "::error::NDK ${NDK_VERSION} was not installed under ${sdk_root}/ndk."
+          # Retry the install up to 3 times - network blips are common on fresh
+          # runners and a single failure would otherwise block the whole release.
+          installed=false
+          for attempt in 1 2 3; do
+            set +o pipefail
+            yes | "${sdkmanager}" --sdk_root="${sdk_root}" --install "ndk;${NDK_VERSION}"
+            rc=$?
+            set -o pipefail
+            if [ -d "${sdk_root}/ndk/${NDK_VERSION}" ]; then
+              installed=true
+              break
+            fi
+            echo "Attempt ${attempt}: NDK not present yet (exit ${rc}), retrying..."
+          done
+
+          if [ "${installed}" = "false" ]; then
+            echo "::error::NDK ${NDK_VERSION} was not installed after 3 attempts."
+            echo "NDK directory listing:"
+            find "${sdk_root}/ndk" -maxdepth 1 -type d 2>/dev/null | sort || true
             exit 1
           fi
-          echo "Installed NDK ${NDK_VERSION}."
+          echo "NDK ${NDK_VERSION} ready."
+          ls -la "${sdk_root}/ndk/${NDK_VERSION}/" | head -5
 
       - name: Resolve Flutter dependencies
         run: flutter pub get
