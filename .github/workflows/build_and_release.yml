@@ -246,6 +246,19 @@ jobs:
       - name: Analyze
         run: flutter analyze --fatal-infos --fatal-warnings
 
+      # Flutter 3.24.5 test harness bug: ScrollPosition.restoreScrollOffset
+      # casts PageStorage state directly to double? — but PageStorage can
+      # store a bool (keyboard showKeyboard path). This mirrors the local
+      # /opt/flutter/ monkey-patch so CI passes on unmodified runners.
+      - name: Patch Flutter harness bug
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="$(find ${FLUTTER_ROOT:-/opt/flutter}/packages/flutter/lib/src/widgets -name scroll_position.dart 2>/dev/null | head -n1)"
+          if [ -z "$f" ]; then echo "::warning::scroll_position.dart not found, skipping patch"; exit 0; fi
+          if grep -q "_saved is num" "$f"; then echo "Already patched"; exit 0; fi
+          sed -i 's|final double? value = PageStorage\.maybeOf(context\.storageContext)?\.readState(context\.storageContext) as double?;|final dynamic _saved = PageStorage.maybeOf(context.storageContext)?.readState(context.storageContext);\n      final double? value = _saved is num ? _saved.toDouble() : null;|' "$f"
+          echo "Patched $f"
       - name: Run the test suite
         run: flutter test --reporter expanded
 
