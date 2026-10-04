@@ -262,47 +262,54 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     final ThemeData theme = Theme.of(context);
     final ColorScheme scheme = theme.colorScheme;
-    final String labels = remembered.map((MemoryEntry e) => e.label).join(', ');
     return Material(
       key: const ValueKey<String>('remembered-strip'),
       color: scheme.secondaryContainer,
-      child: InkWell(
-        onTap: _openMemory,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          child: Row(
-            children: <Widget>[
-              Icon(
-                Icons.school_outlined,
-                size: 16,
-                color: scheme.onSecondaryContainer,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Semantics(
-                  label: 'Remembered ${remembered.length} memories: $labels',
-                  child: Text(
-                    'Remembered ${remembered.length} '
-                    '${remembered.length == 1 ? 'thing' : 'things'} · $labels',
-                    style: theme.textTheme.labelMedium?.copyWith(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: remembered.map((MemoryEntry entry) {
+          return InkWell(
+            key: ValueKey<String>('memory-${entry.id}'),
+            onTap: _openMemory,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(
+                children: <Widget>[
+                  Icon(
+                    Icons.school_outlined,
+                    size: 16,
+                    color: scheme.onSecondaryContainer,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Semantics(
+                      label: 'Remembered: ${entry.label}',
+                      child: Text(
+                        entry.label,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: scheme.onSecondaryContainer,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(
+                      Icons.close,
+                      size: 16,
                       color: scheme.onSecondaryContainer,
                     ),
-                    overflow: TextOverflow.ellipsis,
+                    tooltip: 'Forget this memory',
+                    onPressed: () => widget.controller.forgetMemory(entry.id),
                   ),
-                ),
+                ],
               ),
-              Icon(
-                Icons.chevron_right,
-                size: 16,
-                color: scheme.onSecondaryContainer,
-              ),
-            ],
-          ),
-        ),
+            ),
+          );
+        }).toList(),
       ),
     );
   }
-
   /// A progress chip naming the tool call that is running right now.
   Widget _toolChip(BuildContext context, ToolCall tool) {
     return Padding(
@@ -446,10 +453,21 @@ class _ChatScreenState extends State<ChatScreen> {
           color: scheme.primaryContainer,
           borderRadius: BorderRadius.circular(14),
         ),
-        child: SelectableText(
-          content,
-          semanticsLabel: 'User message: $content',
-          style: TextStyle(color: scheme.onPrimaryContainer),
+        child: GestureDetector(
+          onLongPress: () {
+            widget.controller.remember(content);
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Remembered: ${content.length > 60 ? content.substring(0, 60) : content}'),
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          },
+          child: SelectableText(
+            content,
+            semanticsLabel: 'User message: $content — long-press to remember',
+            style: TextStyle(color: scheme.onPrimaryContainer),
+          ),
         ),
       ),
     );
